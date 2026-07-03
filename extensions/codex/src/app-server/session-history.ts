@@ -16,6 +16,15 @@ import {
 } from "openclaw/plugin-sdk/session-transcript-runtime";
 import { sanitizeCodexHistoryImagePayloads } from "./image-payload-sanitizer.js";
 
+function isMissingFileError(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT",
+  );
+}
+
 export type CodexMirroredSessionHistoryTarget = {
   agentId?: string;
   sessionFile: string;
@@ -30,6 +39,9 @@ export async function readCodexMirroredSessionHistoryMessages(
   try {
     await resolveSessionTranscriptTarget(resolveCodexHistoryTranscriptTarget(target));
     const raw = await fs.readFile(target.sessionFile, "utf-8");
+    if (raw.trim().length === 0) {
+      return [];
+    }
     const entries = parseSessionEntries(raw);
     if (entries.length === 0) {
       return [];
@@ -51,7 +63,10 @@ export async function readCodexMirroredSessionHistoryMessages(
       buildSessionContext(sessionEntries).messages,
       "codex mirrored history",
     );
-  } catch {
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return [];
+    }
     return undefined;
   }
 }
