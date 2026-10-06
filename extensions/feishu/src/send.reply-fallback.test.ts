@@ -85,7 +85,9 @@ describe("Feishu reply fallback for withdrawn/deleted targets", () => {
       expect(requests[0]).toMatch(/^[0-9a-f-]{36}$/);
       expect(requests[1]).toBe(requests[0]);
       expect(sent.size).toBe(1);
-      if (reply) expect(sender.mock.calls[1]?.[0]?.data?.reply_in_thread).toBe(true);
+      if (reply) {
+        expect(sender.mock.calls[1]?.[0]?.data?.reply_in_thread).toBe(true);
+      }
     },
   );
 
