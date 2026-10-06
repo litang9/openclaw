@@ -1,10 +1,11 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClawdbotConfig } from "../runtime-api.js";
 
 const createFeishuClientMock = vi.hoisted(() => vi.fn());
 const resolveFeishuAccountMock = vi.hoisted(() => vi.fn());
 const normalizeFeishuTargetMock = vi.hoisted(() => vi.fn());
 const resolveReceiveIdTypeMock = vi.hoisted(() => vi.fn());
+const fileCreateMock = vi.hoisted(() => vi.fn());
 const imageCreateMock = vi.hoisted(() => vi.fn());
 const messageCreateMock = vi.hoisted(() => vi.fn());
 
@@ -14,11 +15,14 @@ const validPngImage = Buffer.from(
   "hex",
 );
 
+// mock-isolation: Keep real provider clients and their caches out of this transport fixture.
 vi.mock("./client.js", () => ({ createFeishuClient: createFeishuClientMock }));
+// mock-isolation: Use a synthetic configured account without reading operator configuration.
 vi.mock("./accounts.js", () => ({
   resolveFeishuAccount: resolveFeishuAccountMock,
   resolveFeishuRuntimeAccount: resolveFeishuAccountMock,
 }));
+// mock-isolation: Pin recipient routing so this fixture exercises upload and message dispatch only.
 vi.mock("./targets.js", () => ({
   normalizeFeishuTarget: normalizeFeishuTargetMock,
   resolveReceiveIdType: resolveReceiveIdTypeMock,
@@ -49,7 +53,8 @@ describe("sendMediaFeishu retries", () => {
   });
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
+    vi.useFakeTimers();
     resolveFeishuAccountMock.mockReturnValue({
       configured: true,
       accountId: "main",
@@ -63,6 +68,7 @@ describe("sendMediaFeishu retries", () => {
     createFeishuClientMock.mockReturnValue({
       im: {
         image: { create: imageCreateMock },
+        file: { create: fileCreateMock },
         message: { create: messageCreateMock },
       },
     });
@@ -70,12 +76,19 @@ describe("sendMediaFeishu retries", () => {
     messageCreateMock.mockResolvedValue({ code: 0, data: { message_id: "msg_1" } });
   });
 
-  it("reuses one uuid when retrying a transient media message send", async () => {
-    messageCreateMock.mockRejectedValueOnce(
-      Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
-    );
+  afterEach(() => vi.useRealTimers());
 
-    await sendTestImage();
+  it("reuses one uuid when retrying a transient media message send", async () => {
+    const firstDispatch = Promise.withResolvers<void>();
+    messageCreateMock.mockImplementationOnce(async () => {
+      firstDispatch.resolve();
+      throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    });
+
+    const result = sendTestImage();
+    await firstDispatch.promise;
+    await vi.runAllTimersAsync();
+    await result;
 
     const firstUuid = messageData(0).uuid;
     expect(firstUuid).toMatch(/^[0-9a-f-]{36}$/);
@@ -90,6 +103,21 @@ describe("sendMediaFeishu retries", () => {
     await expect(sendTestImage()).rejects.toThrow("Feishu image upload failed");
 
     expect(imageCreateMock).toHaveBeenCalledTimes(1);
+    expect(messageCreateMock).not.toHaveBeenCalled();
+  });
+  it("does not retry file uploads on ambiguous transport failures", async () => {
+    fileCreateMock.mockRejectedValueOnce(
+      Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
+    );
+    await expect(
+      sendMediaFeishu({
+        cfg: emptyConfig,
+        to: "user:ou_target",
+        mediaBuffer: Buffer.from("document"),
+        fileName: "document.txt",
+      }),
+    ).rejects.toThrow("Feishu file upload failed");
+    expect(fileCreateMock).toHaveBeenCalledOnce();
     expect(messageCreateMock).not.toHaveBeenCalled();
   });
 });

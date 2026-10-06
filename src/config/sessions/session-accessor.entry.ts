@@ -1,45 +1,40 @@
+import { isDeepStrictEqual } from "node:util";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { resolveSessionStoreIdentity } from "../../gateway/session-store-key.js";
 import {
-  resolveSessionStoreAgentId,
-  resolveSessionStoreKey,
-} from "../../gateway/session-store-key.js";
-import { isIncognitoSessionKey, resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
+  isIncognitoSessionKey,
+  parseAgentSessionKey,
+  resolveAgentIdFromSessionKey,
+  toAgentStoreSessionKey,
+} from "../../routing/session-key.js";
 import { resolveIncognitoOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.js";
 import type { OpenClawConfig } from "../types.openclaw.js";
-import { resolveAgentMainSessionKey } from "./main-session.js";
-import { resolveStorePath } from "./paths.js";
-import { clearPluginOwnedSessionState } from "./plugin-host-cleanup.js";
+import { collectCanonicalSessionLookupKeys } from "./main-session-key.js";
+import { resolveSessionStorePathCore } from "./paths.js";
 import {
-  countSqliteSessionEntryRowsReadOnly as countSessionEntryRowsReadOnly,
-  copySqliteSessionOwnedStateForCanonicalRepair as copySessionOwnedStateForCanonicalRepair,
-  ensureSqliteSessionEntrySync,
-  hasSqliteSessionEntriesByStatusReadOnly as hasSessionEntriesByStatusReadOnly,
-  listSqliteSessionGenerationIdsForCanonicalRepair as listSessionGenerationIdsForCanonicalRepair,
-  listSqliteSessionChildEntriesReadOnly as listSessionChildEntriesReadOnly,
-  listSqliteSessionEntries,
-  listSqliteSessionEntriesForCanonicalRepair as listSessionEntriesForCanonicalRepair,
-  rehomeSqliteSessionDeliveryReferencesForCanonicalRepair as rehomeSessionDeliveryReferencesForCanonicalRepair,
-  rehomeSqliteSessionDeliveryReferencesForCanonicalRepairBatch as rehomeSessionDeliveryReferencesForCanonicalRepairBatch,
-  listSqliteSessionEntriesReadOnly as listSessionEntriesReadOnly,
-  listSqliteSessionEntryKeysReadOnly as listSessionEntryKeysReadOnly,
-  loadExactSqliteSessionEntry as loadExactSessionEntry,
-  loadExactSqliteSessionEntryReadOnly as loadExactSessionEntryReadOnly,
-  loadSqliteSessionEntry as loadSessionEntry,
-  loadSqliteSessionEntryReadOnly as loadSessionEntryReadOnly,
-  patchSqliteSessionEntry as patchSessionEntry,
-  patchSqliteSessionEntryTarget as patchSessionEntryTarget,
-  readSqliteSessionUpdatedAt as readSessionUpdatedAt,
-  replaceSqliteSessionEntry as replaceSessionEntry,
-  replaceSqliteSessionEntrySync as replaceSessionEntrySync,
-  resolveSqliteSessionEntry,
-  upsertSqliteSessionEntry as upsertSessionEntry,
-} from "./session-accessor.sqlite.js";
+  listSessionEntryRows,
+  listSessionEntriesReadOnly,
+  loadExactSessionEntry,
+  loadExactSessionEntryCandidates,
+  loadExactSessionEntryReadOnly,
+  patchSessionEntryCore,
+  patchSessionEntryTarget,
+} from "./session-accessor.sqlite-entry.js";
+import "./plugin-host-cleanup.js";
+import "./session-accessor.sqlite-canonical-repair.js";
+import {
+  resolveSessionEntry as resolveSessionEntrySelection,
+  retainSessionEntryKeyAbsence,
+} from "./session-accessor.sqlite-exact-read.js";
+import { resolveSqliteSessionKey } from "./session-accessor.sqlite-scope.js";
+import "./session-accessor.sqlite-summary.js";
 import type {
   SessionAccessScope,
   LogicalSessionAccessScope,
   SessionEntryListScope,
   ResolvedSessionEntryAccessTarget,
   ResolvedSessionEntryStoreTarget,
+  QualifiedSessionEntryAccessTarget,
   SessionEntryCandidateAccessScope,
   ResolvedSessionEntryCandidateTarget,
   ResolvedSessionEntryUpdateContext,
@@ -51,62 +46,59 @@ import type {
   SessionEntryPatchResult,
 } from "./session-accessor.types.js";
 import { canonicalSessionKeyMigrationRequiredError } from "./session-canonical-key.js";
-import { resolveSessionStorePathForScope } from "./session-store-path.js";
-import { normalizeStoreSessionKey, resolveSessionStoreEntry } from "./store-entry.js";
-import { resolveAllAgentSessionStoreTargetsSync, type SessionStoreTarget } from "./targets.js";
-import type { SessionEntry } from "./types.js";
-
-export { clearPluginOwnedSessionState };
-
-// SQLite is the only runtime session store. Re-export its canonical entry
-// operations directly instead of maintaining a second pass-through layer.
+import { isNativeSessionEntryRead } from "./session-entry-read-request.js";
+import {
+  readSessionEntryReadOnlyInWorker,
+  withSessionEntriesFromStoresInWorker,
+} from "./session-entry-read-runtime.js";
+import type { CapturedSessionEntryReadSource } from "./session-entry-read-source.types.js";
+import { captureIncognitoSessionBinding } from "./session-incognito-binding.js";
+import { prepareSessionStoreTargetInventory } from "./session-store-target-inventory.js";
+import { prepareSessionStoreTargetInventoryRead } from "./session-store-target-runtime.js";
+import {
+  normalizeStoreSessionKey,
+  resolveSessionStoreEntryCore as resolveSessionEntryFromStore,
+} from "./store-entry.js";
+import {
+  listConfiguredSessionStoreAgentIds,
+  resolveAllAgentSessionStoreTargetsSync,
+  type SessionStoreTarget,
+} from "./targets.js";
+import type { InternalSessionEntry as SessionEntry } from "./types.js";
+export { hasSessionEntriesByStatusReadOnly } from "./session-entry-status-read.js";
+export { clearPluginOwnedSessionState } from "./plugin-host-cleanup.js";
 export {
-  countSessionEntryRowsReadOnly,
-  copySessionOwnedStateForCanonicalRepair,
-  ensureSqliteSessionEntrySync,
-  hasSessionEntriesByStatusReadOnly,
-  listSessionGenerationIdsForCanonicalRepair,
+  copySqliteSessionOwnedStateForCanonicalRepair as copySessionOwnedStateForCanonicalRepair,
+  ensureSqliteTranscriptGenerationsForCanonicalRepair as ensureTranscriptGenerationsForCanonicalRepair,
+  listSqliteSessionGenerationIdsForCanonicalRepair as listSessionGenerationIdsForCanonicalRepair,
+  rehomeSqliteSessionDeliveryReferencesForCanonicalRepair as rehomeSessionDeliveryReferencesForCanonicalRepair,
+  rehomeSqliteSessionDeliveryReferencesForCanonicalRepairBatch as rehomeSessionDeliveryReferencesForCanonicalRepairBatch,
+} from "./session-accessor.sqlite-canonical-repair.js";
+export {
+  ensureSessionEntrySync,
   listSessionChildEntriesReadOnly,
   listSessionEntriesReadOnly,
-  listSessionEntriesForCanonicalRepair,
-  rehomeSessionDeliveryReferencesForCanonicalRepair,
-  rehomeSessionDeliveryReferencesForCanonicalRepairBatch,
   listSessionEntryKeysReadOnly,
   loadExactSessionEntry,
+  loadExactSessionEntryCandidates,
+  loadExactSessionEntryCandidatesReadOnlyBatch,
+  loadExactSessionEntryFromStoreReadOnly,
   loadExactSessionEntryReadOnly,
   loadSessionEntry,
+  loadSessionEntryByIdReadOnly,
   loadSessionEntryReadOnly,
-  patchSessionEntry,
+  patchSessionEntryCore,
   patchSessionEntryTarget,
-  readSessionUpdatedAt,
+  readSessionUpdatedAtCore,
   replaceSessionEntry,
+  // Intentionally unfenced: branching owns session-identity freshness; worker transcript commit
+  // fresh-reads and checks sessionId inside its locked commit, and void/entry has no rebound signal.
   replaceSessionEntrySync,
-  upsertSessionEntry,
-};
+  upsertSessionEntryCore,
+  withSessionEntryReadOnlyScope,
+} from "./session-accessor.sqlite-entry.js";
 
-/** Keeps legacy store-key alias resolution behind the entry owner boundary. */
-export function resolveSessionEntryFromStore(params: {
-  store: Record<string, SessionEntry>;
-  sessionKey: string;
-}): ReturnType<typeof resolveSessionStoreEntry> {
-  return resolveSessionStoreEntry(params);
-}
-
-/** Resolves a session directly through canonical SQLite row and alias ownership. */
-export function resolveSessionEntrySelection(
-  scope: SessionAccessScope,
-  options: { readOnly?: boolean } = {},
-): ReturnType<typeof resolveSessionStoreEntry> {
-  return resolveSqliteSessionEntry(scope, options);
-}
-
-export function resolveAccessStorePath(scope: SessionAccessScope): string {
-  return resolveSessionStorePathForScope(scope);
-}
-
-function isStorePathTemplate(store?: string): boolean {
-  return typeof store === "string" && store.includes("{agentId}");
-}
+export { resolveSessionEntryFromStore, resolveSessionEntrySelection };
 
 function resolveLogicalSessionStoreCandidates(params: {
   agentId: string;
@@ -116,9 +108,12 @@ function resolveLogicalSessionStoreCandidates(params: {
   const storeConfig = params.cfg.session?.store;
   const defaultTarget = {
     agentId: params.agentId,
-    storePath: resolveStorePath(storeConfig, { agentId: params.agentId, env: params.env }),
+    storePath: resolveSessionStorePathCore(storeConfig, {
+      agentId: params.agentId,
+      env: params.env,
+    }),
   };
-  if (!isStorePathTemplate(storeConfig)) {
+  if (typeof storeConfig !== "string" || !storeConfig.includes("{agentId}")) {
     return [defaultTarget];
   }
   const targets = new Map<string, SessionStoreTarget>();
@@ -131,50 +126,31 @@ function resolveLogicalSessionStoreCandidates(params: {
   return [...targets.values()];
 }
 
-function buildLogicalSessionEntryCandidateKeys(params: {
-  agentId: string;
-  canonicalKey: string;
-  cfg: OpenClawConfig;
-  requestedKey: string;
-}): string[] {
-  const targets = new Set<string>();
-  if (params.canonicalKey) {
-    targets.add(params.canonicalKey);
-  }
-  if (params.requestedKey && params.requestedKey !== params.canonicalKey) {
-    targets.add(params.requestedKey);
-  }
-  if (params.canonicalKey === "global" || params.canonicalKey === "unknown") {
-    return [...targets];
-  }
-  const agentMainKey = resolveAgentMainSessionKey({
-    cfg: params.cfg,
-    agentId: params.agentId,
-  });
-  if (params.canonicalKey === agentMainKey) {
-    targets.add(`agent:${params.agentId}:main`);
-  }
-  return [...targets];
-}
-
 function findCanonicalSessionEntryMatch(
   scope: Omit<SessionAccessScope, "sessionKey">,
   canonicalKey: string,
   candidateKeys: readonly string[],
   options: { readOnly?: boolean } = {},
+): (SessionEntrySummary & { readSource?: CapturedSessionEntryReadSource }) | undefined {
+  let readSource: CapturedSessionEntryReadSource | undefined;
+  const entries = loadExactSessionEntryCandidates({
+    ...scope,
+    sessionKeys: candidateKeys,
+    readOnly: options.readOnly !== false,
+    onReadSource: (source) => {
+      readSource = source;
+    },
+  });
+  const selected = selectCanonicalSessionEntryMatch(entries, canonicalKey);
+  return selected ? { ...selected, readSource } : undefined;
+}
+
+function selectCanonicalSessionEntryMatch(
+  entries: readonly SessionEntrySummary[],
+  canonicalKey: string,
 ): SessionEntrySummary | undefined {
   let selected: SessionEntrySummary | undefined;
-  for (const candidate of candidateKeys) {
-    const trimmed = candidate.trim();
-    if (!trimmed) {
-      continue;
-    }
-    const loadExact =
-      options.readOnly === false ? loadExactSessionEntry : loadExactSessionEntryReadOnly;
-    const match = loadExact({ ...scope, sessionKey: trimmed });
-    if (!match) {
-      continue;
-    }
+  for (const match of entries) {
     if (selected) {
       throw canonicalSessionKeyMigrationRequiredError(
         `duplicate rows resolve to canonical session key ${canonicalKey}`,
@@ -190,11 +166,101 @@ function findCanonicalSessionEntryMatch(
   return selected;
 }
 
+/** Read descriptive entry data with the logical accessor's existing candidate selection. */
+export async function readResolvedSessionEntryInWorker(
+  scope: LogicalSessionAccessScope,
+): Promise<SessionEntry | undefined> {
+  const { agentId, canonicalKey } = resolveSessionStoreIdentity({
+    cfg: scope.cfg,
+    sessionKey: scope.sessionKey.trim(),
+    agentId: scope.agentId,
+  });
+  const storePath = resolveSessionStorePathCore(scope.cfg.session?.store, {
+    agentId,
+    env: scope.env,
+  });
+  if (captureIncognitoSessionBinding({ ...scope, sessionKey: canonicalKey })) {
+    return readSessionEntryReadOnlyInWorker({ ...scope, agentId, sessionKey: canonicalKey });
+  }
+  if (isNativeSessionEntryRead({ ...scope, sessionKey: canonicalKey, storePath }, agentId)) {
+    return resolveSessionEntryAccessTarget(scope).entry;
+  }
+  const sessionKeys = collectCanonicalSessionLookupKeys({
+    agentId,
+    canonicalKey,
+    mainKey: scope.cfg.session?.mainKey,
+    requestedKey: scope.sessionKey.trim(),
+  });
+  const perAgent = scope.cfg.session?.store?.includes("{agentId}") === true;
+  if (!perAgent) {
+    return withSessionEntriesFromStoresInWorker(
+      [
+        {
+          agentId,
+          storePath,
+          sessionKeys,
+          projection: "exact",
+          snapshotFields: [],
+          env: scope.env,
+        },
+      ],
+      ([loaded]) => selectCanonicalSessionEntryMatch(loaded!.result.entries, canonicalKey)?.entry,
+    );
+  }
+  const inventory = prepareSessionStoreTargetInventory(
+    scope.cfg,
+    [agentId, ...listConfiguredSessionStoreAgentIds(scope.cfg)],
+    scope.env,
+    "recovery",
+  );
+  const read = prepareSessionStoreTargetInventoryRead(inventory);
+  return read.withRead(async (sources, assertCurrent) => {
+    const candidates = new Map<string, SessionStoreTarget>();
+    const fallback = inventory.paths.get(agentId)!.configured;
+    candidates.set(fallback, { agentId, storePath: fallback });
+    for (const source of sources.agents) {
+      if (source.agentId === agentId && source.result.available) {
+        for (const target of source.result.targets) {
+          candidates.set(target.storePath, target);
+        }
+      }
+    }
+    return withSessionEntriesFromStoresInWorker(
+      [...candidates.values()].map((target) => ({
+        agentId: target.agentId,
+        storePath: target.storePath,
+        sessionKeys,
+        projection: "exact" as const,
+        snapshotFields: [],
+        env: inventory.env,
+      })),
+      (loaded) => {
+        assertCurrent();
+        return selectCanonicalSessionEntryMatch(
+          loaded.flatMap(({ result }) => result.entries),
+          canonicalKey,
+        )?.entry;
+      },
+    );
+  });
+}
+
 /** Resolves one canonical row across the prepared configured and discovered store targets. */
 export function resolveSessionEntryAccessTarget(
   scope: LogicalSessionAccessScope,
-): ResolvedSessionEntryAccessTarget {
+  options: { keyFormat: "agent-qualified" },
+): QualifiedSessionEntryAccessTarget;
+export function resolveSessionEntryAccessTarget(
+  scope: LogicalSessionAccessScope,
+): ResolvedSessionEntryAccessTarget;
+export function resolveSessionEntryAccessTarget(
+  scope: LogicalSessionAccessScope,
+  options?: { keyFormat: "agent-qualified" },
+): ResolvedSessionEntryAccessTarget | QualifiedSessionEntryAccessTarget {
   const target = resolveSessionEntryStoreTarget(scope);
+  if (options?.keyFormat === "agent-qualified") {
+    return projectQualifiedSessionEntryTarget(scope, target);
+  }
   return {
     agentId: target.agentId,
     canonicalKey: target.canonicalKey,
@@ -213,7 +279,7 @@ export function resolveSessionEntryCandidateTarget(
   const incognitoAgentId = incognitoKey ? resolveAgentIdFromSessionKey(incognitoKey) : undefined;
   const storePath = incognitoAgentId
     ? resolveIncognitoOpenClawAgentSqlitePath({ agentId: incognitoAgentId, env: scope.env })
-    : resolveStorePath(scope.cfg.session?.store, {
+    : resolveSessionStorePathCore(scope.cfg.session?.store, {
         agentId: scope.agentId,
         env: scope.env,
       });
@@ -237,7 +303,7 @@ export function resolveSessionEntryCandidateTarget(
     return {
       agentId: resolvedAgentId,
       candidateKey,
-      entry: structuredClone(resolved.existing),
+      entry: resolved.existing,
       persisted: true,
       sessionKey: resolved.normalizedKey,
     };
@@ -255,63 +321,112 @@ export function resolveSessionEntryCandidateTarget(
   };
 }
 
+/** Retain one actor across ordered candidate reads; ordinary routing remains native until P7. */
+export function resolveSessionEntryCandidateTargetForRuntime(
+  scope: SessionEntryCandidateAccessScope,
+):
+  | ResolvedSessionEntryCandidateTarget
+  | null
+  | Promise<ResolvedSessionEntryCandidateTarget | null> {
+  const candidates = uniqueStrings(scope.candidateKeys.map((key) => key.trim()));
+  const sessionKey = candidates.find(isIncognitoSessionKey);
+  const binding = sessionKey && captureIncognitoSessionBinding({ ...scope, sessionKey });
+  if (!binding) {
+    return resolveSessionEntryCandidateTarget(scope);
+  }
+  const snapshots: Array<{ assertCurrent(): void }> = [];
+  const assertCurrent = () => {
+    binding.admissionSignal?.throwIfAborted();
+    binding.actor.assertReadable();
+    snapshots.forEach((snapshot) => snapshot.assertCurrent());
+  };
+  return binding.actor.sessions
+    .withSharedState(async () => {
+      for (const candidateKey of candidates) {
+        const normalizedKey = resolveSqliteSessionKey(candidateKey, binding.actor.agentId);
+        // The selected incognito store cannot contain durable keys; retain candidate ordering.
+        if (!isIncognitoSessionKey(normalizedKey)) {
+          continue;
+        }
+        const read = await binding.actor.sessions.read(
+          { assertCurrent: () => binding.actor.assertReadable() },
+          { sessionKey: normalizedKey },
+          binding.admissionSignal,
+        );
+        snapshots.push(read.snapshot);
+        assertCurrent();
+        if (read.entry) {
+          return {
+            agentId: binding.actor.agentId,
+            candidateKey,
+            entry: read.entry,
+            persisted: true,
+            sessionKey: normalizedKey,
+          };
+        }
+      }
+      const fallback = scope.fallback;
+      const fallbackKey = fallback?.sessionKey.trim();
+      return fallback && fallbackKey
+        ? {
+            agentId: binding.actor.agentId,
+            candidateKey: fallbackKey,
+            entry: structuredClone(fallback.entry),
+            persisted: false,
+            sessionKey: fallbackKey,
+          }
+        : null;
+    })
+    .then((result) => {
+      assertCurrent();
+      return result;
+    });
+}
+
 function resolveSessionEntryStoreTarget(
   scope: LogicalSessionAccessScope,
-): ResolvedSessionEntryStoreTarget {
+): ResolvedSessionEntryStoreTarget & { readSource?: CapturedSessionEntryReadSource } {
   const requestedKey = scope.sessionKey.trim();
-  const canonicalKey = resolveSessionStoreKey({ cfg: scope.cfg, sessionKey: requestedKey });
-  const agentId = resolveSessionStoreAgentId(scope.cfg, canonicalKey);
-  const scanTargets = buildLogicalSessionEntryCandidateKeys({
+  const { agentId, canonicalKey } = resolveSessionStoreIdentity({
+    cfg: scope.cfg,
+    sessionKey: requestedKey,
+    agentId: scope.agentId,
+  });
+  const scanTargets = collectCanonicalSessionLookupKeys({
     agentId,
     canonicalKey,
-    cfg: scope.cfg,
+    mainKey: scope.cfg.session?.mainKey,
     requestedKey,
   });
-  if (isIncognitoSessionKey(canonicalKey)) {
-    const incognitoAgentId = resolveAgentIdFromSessionKey(canonicalKey);
-    const storePath = resolveIncognitoOpenClawAgentSqlitePath({
-      agentId: incognitoAgentId,
-      env: scope.env,
-    });
-    const selectedMatch = findCanonicalSessionEntryMatch(
-      { agentId: incognitoAgentId, ...(scope.env ? { env: scope.env } : {}), storePath },
-      canonicalKey,
-      scanTargets,
-      { readOnly: false },
-    );
-    return {
-      agentId: incognitoAgentId,
-      canonicalKey,
-      entry: selectedMatch?.entry,
-      requestedKey,
-      storeKey: selectedMatch?.sessionKey ?? canonicalKey,
-      storePath,
-    };
-  }
-  const candidates = resolveLogicalSessionStoreCandidates({
-    agentId,
-    cfg: scope.cfg,
-    env: scope.env,
-  });
+  const incognito = isIncognitoSessionKey(canonicalKey);
+  const targetAgentId = incognito ? resolveAgentIdFromSessionKey(canonicalKey) : agentId;
+  const candidates = incognito
+    ? [
+        {
+          agentId: targetAgentId,
+          storePath: resolveIncognitoOpenClawAgentSqlitePath({
+            agentId: targetAgentId,
+            env: scope.env,
+          }),
+        },
+      ]
+    : resolveLogicalSessionStoreCandidates({ agentId, cfg: scope.cfg, env: scope.env });
   const fallback = candidates[0] ?? {
     agentId,
-    storePath: resolveStorePath(scope.cfg.session?.store, { agentId, env: scope.env }),
+    storePath: resolveSessionStorePathCore(scope.cfg.session?.store, { agentId, env: scope.env }),
   };
   let selectedStorePath = fallback.storePath;
-  let selectedMatch = findCanonicalSessionEntryMatch(
-    { agentId, ...(scope.env ? { env: scope.env } : {}), storePath: fallback.storePath },
-    canonicalKey,
-    scanTargets,
-  );
-  for (let index = 1; index < candidates.length; index += 1) {
-    const candidate = candidates[index];
-    if (!candidate) {
-      continue;
-    }
+  let selectedMatch: ReturnType<typeof findCanonicalSessionEntryMatch>;
+  for (const candidate of [fallback, ...candidates.slice(1)]) {
     const match = findCanonicalSessionEntryMatch(
-      { agentId, ...(scope.env ? { env: scope.env } : {}), storePath: candidate.storePath },
+      {
+        agentId: targetAgentId,
+        ...(scope.env ? { env: scope.env } : {}),
+        storePath: candidate.storePath,
+      },
       canonicalKey,
       scanTargets,
+      { readOnly: !incognito },
     );
     if (match && selectedMatch) {
       throw canonicalSessionKeyMigrationRequiredError(
@@ -324,13 +439,118 @@ function resolveSessionEntryStoreTarget(
     }
   }
   return {
-    agentId,
+    agentId: targetAgentId,
     canonicalKey,
     entry: selectedMatch?.entry,
     requestedKey,
     storeKey: selectedMatch?.sessionKey ?? canonicalKey,
     storePath: selectedStorePath,
+    readSource: selectedMatch?.readSource,
   };
+}
+
+function projectQualifiedSessionEntryTarget(
+  scope: Pick<LogicalSessionAccessScope, "env">,
+  target: ResolvedSessionEntryStoreTarget & { readSource?: CapturedSessionEntryReadSource },
+): QualifiedSessionEntryAccessTarget {
+  const prepared = prepareQualifiedSessionEntryTarget(target, undefined, scope.env);
+  try {
+    return prepared.target;
+  } finally {
+    prepared.release();
+  }
+}
+
+export function prepareQualifiedSessionEntryTarget(
+  target: ResolvedSessionEntryStoreTarget & { readSource?: CapturedSessionEntryReadSource },
+  readSources: readonly CapturedSessionEntryReadSource[] = [],
+  env?: NodeJS.ProcessEnv,
+) {
+  // Projection never reinterprets the original selector or selects a different row.
+  if (target.entry && !target.readSource) {
+    throw new Error("Qualified session projection requires its captured physical source");
+  }
+  const canonicalKey = toAgentStoreSessionKey({
+    agentId: target.agentId,
+    requestKey: target.storeKey,
+  });
+  const parsed = parseAgentSessionKey(canonicalKey);
+  const physicalKeys = (physicalAgentId: string) => {
+    if (parsed?.rest !== "global" && parsed?.rest !== "unknown") {
+      return [canonicalKey];
+    }
+    return physicalAgentId === target.agentId ? [parsed.rest, canonicalKey] : [canonicalKey];
+  };
+  const qualified: QualifiedSessionEntryAccessTarget = {
+    keyFormat: "agent-qualified",
+    agentId: target.agentId,
+    canonicalKey,
+    requestedKey: target.requestedKey,
+    storeKey: target.storeKey,
+    storeKeys: uniqueStrings([
+      target.storeKey,
+      ...physicalKeys(target.readSource?.agentId ?? target.agentId),
+    ]),
+    storePath: target.readSource?.path ?? target.storePath,
+    entry: target.entry,
+    readSource: target.readSource,
+  };
+  const sources: ReturnType<typeof retainSessionEntryKeyAbsence>[] = [];
+  let active = true;
+  const release = () => {
+    active = false;
+    const failures: unknown[] = [];
+    for (let index = sources.length - 1; index >= 0; index--) {
+      try {
+        sources[index]!.release();
+        sources.splice(index, 1);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length) {
+      throw new AggregateError(failures, "Qualified session sources could not be released");
+    }
+  };
+  try {
+    const capturedSources = target.readSource
+      ? [
+          target.readSource,
+          ...readSources.filter((source) => !isDeepStrictEqual(source, target.readSource)),
+        ]
+      : readSources;
+    for (const readSource of capturedSources) {
+      const selectedSource =
+        readSource.agentId === target.readSource?.agentId &&
+        readSource.databaseIdentity === target.readSource.databaseIdentity &&
+        readSource.databaseBirthtime === target.readSource.databaseBirthtime;
+      sources.push(
+        retainSessionEntryKeyAbsence({
+          source: readSource,
+          canonicalKey,
+          sessionKeys: physicalKeys(readSource.agentId).filter(
+            (key) => !selectedSource || key !== target.storeKey,
+          ),
+          env,
+        }),
+      );
+    }
+    return {
+      target: qualified,
+      assertCurrent: () => {
+        if (!active) {
+          throw new Error("Qualified session target is no longer active");
+        }
+        for (const source of sources) {
+          source.assertCurrent();
+        }
+      },
+      release,
+    };
+  } catch (error) {
+    release();
+    throw error;
+  }
 }
 
 /**
@@ -340,30 +560,68 @@ function resolveSessionEntryStoreTarget(
 export async function updateResolvedSessionEntry<T>(
   scope: LogicalSessionAccessScope,
   update: (entry: SessionEntry, context: ResolvedSessionEntryUpdateContext) => Promise<T> | T,
+  options?: { target: QualifiedSessionEntryAccessTarget },
 ): Promise<ResolvedSessionEntryUpdateResult<T>> {
-  const target = resolveSessionEntryStoreTarget(scope);
-  if (!target.entry) {
+  const captured = options?.target;
+  const target = captured ?? resolveSessionEntryStoreTarget(scope);
+  const source = captured?.readSource;
+  if (!target.entry || (captured && !source)) {
     return { canonicalKey: target.canonicalKey, found: false };
   }
+  if (captured) {
+    const current = resolveSessionStoreIdentity({
+      cfg: scope.cfg,
+      sessionKey: scope.sessionKey,
+      agentId: scope.agentId,
+    });
+    if (
+      scope.sessionKey.trim() !== captured.requestedKey ||
+      current.agentId !== captured.agentId ||
+      current.canonicalKey !== captured.storeKey
+    ) {
+      throw new Error("Captured session selector changed before update");
+    }
+  }
+  const expectedSessionId = target.entry.sessionId;
+  const expectedLifecycleRevision = target.entry.lifecycleRevision;
   let updateResult: T | undefined;
-  const updated = await patchSessionEntry(
-    { sessionKey: target.storeKey, storePath: target.storePath },
-    async (entry) => {
-      const context: ResolvedSessionEntryUpdateContext = {
-        agentId: target.agentId,
-        canonicalKey: target.canonicalKey,
-        entry,
-        requestedKey: target.requestedKey,
-        storeKey: target.storeKey,
-      };
-      updateResult = await update(entry, context);
-      return entry;
-    },
-    {
-      replaceEntry: true,
-      skipMaintenance: true,
-    },
-  );
+  const apply = async (entry: SessionEntry) => {
+    if (
+      captured &&
+      (entry.sessionId !== expectedSessionId ||
+        entry.lifecycleRevision !== expectedLifecycleRevision)
+    ) {
+      throw new Error("Captured session generation changed before update");
+    }
+    const context: ResolvedSessionEntryUpdateContext = {
+      agentId: target.agentId,
+      canonicalKey: target.canonicalKey,
+      entry,
+      requestedKey: target.requestedKey,
+      storeKey: target.storeKey,
+    };
+    updateResult = await update(entry, context);
+    return entry;
+  };
+  const patchOptions = { replaceEntry: true, skipMaintenance: true };
+  const updated =
+    captured && source
+      ? await patchSessionEntryTarget(
+          {
+            agentId: captured.agentId,
+            env: scope.env,
+            storePath: source.path,
+            readSource: source,
+            target: { canonicalKey: captured.storeKey, storeKeys: [...captured.storeKeys] },
+          },
+          apply,
+          patchOptions,
+        )
+      : await patchSessionEntryCore(
+          { agentId: target.agentId, sessionKey: target.storeKey, storePath: target.storePath },
+          apply,
+          patchOptions,
+        );
   if (!updated) {
     return { canonicalKey: target.canonicalKey, found: false };
   }
@@ -377,19 +635,17 @@ export async function updateResolvedSessionEntry<T>(
 }
 
 /** Lists entries from the resolved store, preserving the persisted key for each row. */
-export function listSessionEntries(scope: SessionEntryListScope = {}): SessionEntrySummary[] {
+export function listSessionEntriesCore(scope: SessionEntryListScope = {}): SessionEntrySummary[] {
   if (scope.clone === false) {
     return openSessionEntryReadView(scope).entries();
   }
-  return listSqliteSessionEntries(scope);
+  return listSessionEntryRows(scope);
 }
 
 /**
- * Borrowed keyed view over one resolved store for synchronous read-only hot paths.
- * Unlike loadSessionEntry, `get` is a raw exact persisted-key probe with no alias
- * or canonical-key resolution. The first probe materializes one validated store
- * snapshot; later probes and `entries` reuse its parsed rows. Rows are borrowed,
- * not cloned: callers must not mutate them and must drop the view before any await.
+ * Synchronous read view: `get` queries one exact persisted key without alias resolution;
+ * `entries` caches listing metadata or loads complete entries. Rows and nested values are
+ * borrowed: callers must not mutate them and must drop the view before any await.
  */
 export function openSessionEntryReadView(
   scope: Omit<SessionEntryListScope, "clone" | "readConsistency"> = {},
@@ -401,7 +657,7 @@ export function openSessionEntryReadView(
         clone: false,
         sessionKey,
       })?.entry,
-    entries: () => listSqliteSessionEntries({ ...scope, clone: false }),
+    entries: () => listSessionEntriesReadOnly({ ...scope, clone: false }),
   };
 }
 
@@ -417,11 +673,6 @@ export async function patchSessionEntryWithKey(
   ) => Promise<Partial<SessionEntry> | null> | Partial<SessionEntry> | null,
   options: SessionEntryPatchOptions = {},
 ): Promise<SessionEntryPatchResult | null> {
-  const entry = await patchSessionEntry(scope, update, options);
+  const entry = await patchSessionEntryCore(scope, update, options);
   return entry ? { sessionKey: normalizeStoreSessionKey(scope.sessionKey), entry } : null;
 }
-
-/**
- * Copies one parent transcript into a new child transcript target.
- * This is for guarded callers that already own the eventual entry commit.
- */

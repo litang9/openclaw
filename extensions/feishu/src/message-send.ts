@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Client } from "@larksuiteoapi/node-sdk";
 import { requestFeishuApi } from "./comment-shared.js";
+import { withFeishuMessageDispatch } from "./send-context.js";
 
 export type FeishuReceiveIdType = "chat_id" | "email" | "open_id" | "union_id" | "user_id";
 
@@ -24,32 +25,33 @@ export async function sendIdempotentFeishuMessage(params: {
 }) {
   const uuid = randomUUID();
   return requestFeishuApi(
-    () => {
-      if (params.replyToMessageId) {
-        return params.client.im.message.reply({
-          path: { message_id: params.replyToMessageId },
-          data: {
-            content: params.content,
-            msg_type: params.msgType,
-            uuid,
-            ...(params.replyInThread ? { reply_in_thread: true } : {}),
-          },
-        });
-      }
+    () =>
+      withFeishuMessageDispatch(() => {
+        if (params.replyToMessageId) {
+          return params.client.im.message.reply({
+            path: { message_id: params.replyToMessageId },
+            data: {
+              content: params.content,
+              msg_type: params.msgType,
+              uuid,
+              ...(params.replyInThread ? { reply_in_thread: true } : {}),
+            },
+          });
+        }
 
-      // Feishu accepts root_id for message.create although the SDK request type omits it.
-      const data = {
-        receive_id: params.receiveId,
-        content: params.content,
-        msg_type: params.msgType,
-        uuid,
-        ...(params.rootId ? { root_id: params.rootId } : {}),
-      };
-      return params.client.im.message.create({
-        params: { receive_id_type: params.receiveIdType },
-        data,
-      });
-    },
+        // Feishu accepts root_id for message.create although the SDK request type omits it.
+        const data = {
+          receive_id: params.receiveId,
+          content: params.content,
+          msg_type: params.msgType,
+          uuid,
+          ...(params.rootId ? { root_id: params.rootId } : {}),
+        };
+        return params.client.im.message.create({
+          params: { receive_id_type: params.receiveIdType },
+          data,
+        });
+      }),
     params.errorPrefix,
     {
       includeNestedErrorLogId: params.includeNestedErrorLogId,

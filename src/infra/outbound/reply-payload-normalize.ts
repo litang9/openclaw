@@ -1,35 +1,26 @@
-// Reply-payload normalization projects loose tool/agent objects onto the
-// outbound-supported reply payload fields.
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { readStringValue } from "@openclaw/normalization-core/string-coerce";
 import type { ReplyPayload as InternalReplyPayload } from "../../auto-reply/reply-payload.js";
 import { normalizeOutboundLocation } from "../../channels/location.js";
 
-/**
- * Outbound-facing subset of reply payload fields accepted from loose producers.
- */
-export type OutboundReplyPayload = {
-  text?: string;
-  mediaUrls?: string[];
-  mediaUrl?: string;
-  presentation?: InternalReplyPayload["presentation"];
-  presentationTextMode?: InternalReplyPayload["presentationTextMode"];
-  /**
-   * @deprecated Use presentation. Runtime support remains for legacy producers.
-   */
-  interactive?: InternalReplyPayload["interactive"];
-  channelData?: InternalReplyPayload["channelData"];
-  sensitiveMedia?: boolean;
-  replyToId?: string;
-  location?: InternalReplyPayload["location"];
-  videoAsNote?: boolean;
-};
-
-function readObjectValue(value: unknown): object | undefined {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
-}
+/** Outbound fields accepted from loose producers. */
+export type OutboundReplyPayload = Pick<
+  InternalReplyPayload,
+  | "text"
+  | "mediaUrls"
+  | "mediaUrl"
+  | "presentation"
+  | "presentationTextMode"
+  | "interactive"
+  | "channelData"
+  | "sensitiveMedia"
+  | "replyToId"
+  | "location"
+  | "videoAsNote"
+>;
 
 /** Extract the supported outbound reply fields from loose tool or agent payload objects. */
-export function normalizeOutboundReplyPayload(
+export function normalizeOutboundReplyPayloadCore(
   payload: Record<string, unknown>,
 ): OutboundReplyPayload {
   const text = readStringValue(payload.text);
@@ -39,12 +30,12 @@ export function normalizeOutboundReplyPayload(
       )
     : undefined;
   const mediaUrl = readStringValue(payload.mediaUrl);
-  const presentation = readObjectValue(
+  const presentation = asOptionalRecord(
     payload.presentation,
   ) as OutboundReplyPayload["presentation"];
   const presentationTextMode = payload.presentationTextMode === "fallback" ? "fallback" : undefined;
-  const interactive = readObjectValue(payload.interactive) as OutboundReplyPayload["interactive"];
-  const channelData = readObjectValue(payload.channelData) as OutboundReplyPayload["channelData"];
+  const interactive = asOptionalRecord(payload.interactive) as OutboundReplyPayload["interactive"];
+  const channelData = asOptionalRecord(payload.channelData) as OutboundReplyPayload["channelData"];
   const sensitiveMedia = payload.sensitiveMedia === true ? true : undefined;
   const replyToId = readStringValue(payload.replyToId);
   const location = normalizeOutboundLocation(payload.location);

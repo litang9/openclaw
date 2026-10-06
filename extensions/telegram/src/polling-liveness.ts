@@ -1,11 +1,9 @@
-// Telegram plugin module implements polling liveness behavior.
 import { formatDurationPrecise } from "openclaw/plugin-sdk/runtime-env";
 import { formatErrorMessage } from "openclaw/plugin-sdk/ssrf-runtime";
 
 type TelegramPollingLivenessTrackerOptions = {
   now?: () => number;
   monotonicNow?: () => number;
-  onPollSuccess?: (finishedAt: number) => void;
 };
 
 type TelegramPollingStall = {
@@ -24,6 +22,7 @@ export class TelegramPollingLivenessTracker {
   #inFlightGetUpdates = 0;
   #stallDiagLoggedMonotonicAt = 0;
   #lastStallCheckMonotonicAt: number;
+  #retryAfterUntilMonotonicAt: number | null = null;
 
   constructor(private readonly options: TelegramPollingLivenessTrackerOptions = {}) {
     const monotonicNow = this.#monotonicNow();
@@ -31,12 +30,9 @@ export class TelegramPollingLivenessTracker {
     this.#lastStallCheckMonotonicAt = monotonicNow;
   }
 
-  get inFlightGetUpdates() {
-    return this.#inFlightGetUpdates;
-  }
-
   noteGetUpdatesStarted(payload: unknown, at = this.#now()) {
     const startedMonotonicAt = this.#monotonicNow();
+    this.#retryAfterUntilMonotonicAt = null;
     this.#lastGetUpdatesActivityMonotonicAt = startedMonotonicAt;
     this.#lastGetUpdatesStartedAt = at;
     this.#lastGetUpdatesStartedMonotonicAt = startedMonotonicAt;
@@ -48,21 +44,17 @@ export class TelegramPollingLivenessTracker {
     this.#lastGetUpdatesError = null;
   }
 
-  noteGetUpdatesSuccess(result: unknown, at = this.#now()) {
-    this.#noteGetUpdatesCompleted(at);
-    this.#lastGetUpdatesOutcome = Array.isArray(result) ? `ok:${result.length}` : "ok";
-    this.options.onPollSuccess?.(at);
-  }
-
   noteGetUpdatesSuccessCount(count: number, at = this.#now()) {
     this.#noteGetUpdatesCompleted(at);
     const normalizedCount = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
     this.#lastGetUpdatesOutcome = `ok:${normalizedCount}`;
-    this.options.onPollSuccess?.(at);
   }
 
-  noteGetUpdatesError(err: unknown, at = this.#now()) {
+  noteGetUpdatesError(err: unknown, at = this.#now(), retryAfterMs?: number) {
     this.#noteGetUpdatesCompleted(at);
+    if (retryAfterMs !== undefined && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+      this.#retryAfterUntilMonotonicAt = this.#monotonicNow() + retryAfterMs;
+    }
     this.#lastGetUpdatesOutcome = "error";
     this.#lastGetUpdatesError = formatErrorMessage(err);
   }
@@ -83,6 +75,14 @@ export class TelegramPollingLivenessTracker {
     // missing two full detection windows. Rebase once, then observe normally.
     if (checkGap > params.thresholdMs * 2) {
       this.#lastGetUpdatesActivityMonotonicAt = monotonicNow;
+      return null;
+    }
+    // Flood waits excuse an idle worker, never a newly stuck in-flight poll.
+    if (
+      this.#inFlightGetUpdates === 0 &&
+      this.#retryAfterUntilMonotonicAt !== null &&
+      monotonicNow <= this.#retryAfterUntilMonotonicAt
+    ) {
       return null;
     }
     const elapsed = monotonicNow - this.#lastGetUpdatesActivityMonotonicAt;
@@ -122,6 +122,7 @@ export class TelegramPollingLivenessTracker {
 
   #noteGetUpdatesCompleted(finishedAt: number): void {
     const finishedMonotonicAt = this.#monotonicNow();
+    this.#retryAfterUntilMonotonicAt = null;
     this.#lastGetUpdatesActivityMonotonicAt = finishedMonotonicAt;
     this.#lastGetUpdatesFinishedAt = finishedAt;
     this.#lastGetUpdatesDurationMs =

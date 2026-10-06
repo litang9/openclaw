@@ -2,12 +2,18 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeDiscordRest } from "./send.test-harness.js";
 
 const loadWebMediaRawMock = vi.hoisted(() => vi.fn());
 vi.mock("openclaw/plugin-sdk/web-media", () => ({
   loadWebMediaRaw: loadWebMediaRawMock,
+}));
+
+const tempPathMocks = vi.hoisted(() => ({ rootDir: "" }));
+vi.mock("openclaw/plugin-sdk/temp-path", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/temp-path")>()),
+  resolvePreferredOpenClawTmpDir: () => tempPathMocks.rootDir,
 }));
 
 const voiceMocks = vi.hoisted(() => ({
@@ -25,7 +31,14 @@ let sendVoiceMessageDiscord: typeof import("./send.voice.js").sendVoiceMessageDi
 
 describe("sendVoiceMessageDiscord", () => {
   beforeAll(async () => {
+    tempPathMocks.rootDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "openclaw-discord-voice-send-"),
+    );
     ({ sendVoiceMessageDiscord } = await import("./send.voice.js"));
+  });
+
+  afterAll(async () => {
+    await fs.rm(tempPathMocks.rootDir, { recursive: true, force: true });
   });
 
   beforeEach(() => {
@@ -47,22 +60,30 @@ describe("sendVoiceMessageDiscord", () => {
     });
   });
 
-  it("treats bare numeric voice targets as channels", async () => {
-    const { rest } = makeDiscordRest();
+  it("validates runtime config before materializing voice media", async () => {
+    await expect(
+      sendVoiceMessageDiscord("273512430271856640", "https://example.com/voice.ogg", {
+        cfg: undefined as never,
+      }),
+    ).rejects.toThrow(/requires a resolved runtime config/i);
 
-    const result = await sendVoiceMessageDiscord(
-      "273512430271856640",
-      "https://example.com/voice.ogg",
-      {
+    expect(loadWebMediaRawMock).not.toHaveBeenCalled();
+    await expect(fs.readdir(tempPathMocks.rootDir)).resolves.toEqual([]);
+  });
+
+  it("cleans materialized voice media when pre-send conversion fails", async () => {
+    const { rest } = makeDiscordRest();
+    voiceMocks.ensureOggOpus.mockRejectedValueOnce(new Error("ffmpeg unavailable"));
+
+    await expect(
+      sendVoiceMessageDiscord("273512430271856640", "https://example.com/voice.ogg", {
         cfg: DISCORD_TEST_CFG,
         rest,
         token: "t",
-      },
-    );
+      }),
+    ).rejects.toThrow("ffmpeg unavailable");
 
-    expect(result.channelId).toBe("273512430271856640");
-    expect(voiceMocks.sendDiscordVoiceMessage).toHaveBeenCalledTimes(1);
-    expect(voiceMocks.sendDiscordVoiceMessage.mock.calls[0]?.[1]).toBe("273512430271856640");
+    await expect(fs.readdir(tempPathMocks.rootDir)).resolves.toEqual([]);
   });
 
   it("records the native reply target in voice receipts", async () => {
@@ -79,6 +100,9 @@ describe("sendVoiceMessageDiscord", () => {
       },
     );
 
+    expect(result.channelId).toBe("273512430271856640");
+    expect(voiceMocks.sendDiscordVoiceMessage).toHaveBeenCalledTimes(1);
+    expect(voiceMocks.sendDiscordVoiceMessage.mock.calls[0]?.[1]).toBe("273512430271856640");
     expect(voiceMocks.sendDiscordVoiceMessage.mock.calls[0]?.[4]).toBe("reply-1");
     expect(result.receipt.replyToId).toBe("reply-1");
     expect(result.receipt.parts[0]?.replyToId).toBe("reply-1");

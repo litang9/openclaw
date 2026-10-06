@@ -47,10 +47,10 @@ function plugin(
 }
 
 function mockManifestPlugins(plugins: unknown[]) {
-  vi.spyOn(manifestRegistry, "loadPluginManifestRegistry").mockReturnValue({
+  vi.spyOn(manifestRegistry, "loadPluginManifestRegistryCore").mockReturnValue({
     plugins,
     diagnostics: [],
-  } as unknown as ReturnType<typeof manifestRegistry.loadPluginManifestRegistry>);
+  } as unknown as ReturnType<typeof manifestRegistry.loadPluginManifestRegistryCore>);
 }
 
 describe("channel plugin blockers", () => {
@@ -60,10 +60,12 @@ describe("channel plugin blockers", () => {
   });
 
   it("returns no blockers when config and package env have no channel surfaces", () => {
-    const registrySpy = vi.spyOn(manifestRegistry, "loadPluginManifestRegistry").mockReturnValue({
-      plugins: [],
-      diagnostics: [],
-    });
+    const registrySpy = vi
+      .spyOn(manifestRegistry, "loadPluginManifestRegistryCore")
+      .mockReturnValue({
+        plugins: [],
+        diagnostics: [],
+      });
 
     const hits = scanConfiguredChannelPluginBlockers({
       channels: {
@@ -114,10 +116,12 @@ describe("channel plugin blockers", () => {
   });
 
   it("uses provided manifest records without loading the registry", () => {
-    const registrySpy = vi.spyOn(manifestRegistry, "loadPluginManifestRegistry").mockReturnValue({
-      plugins: [],
-      diagnostics: [],
-    });
+    const registrySpy = vi
+      .spyOn(manifestRegistry, "loadPluginManifestRegistryCore")
+      .mockReturnValue({
+        plugins: [],
+        diagnostics: [],
+      });
 
     const hits = scanConfiguredChannelPluginBlockers(
       {
@@ -130,21 +134,7 @@ describe("channel plugin blockers", () => {
       {},
       {},
       {
-        manifestRecords: [
-          {
-            id: "discord",
-            origin: "global",
-            channels: ["discord"],
-            providers: [],
-            cliBackends: [],
-            skills: [],
-            hooks: [],
-            enabledByDefault: false,
-            rootDir: "/plugins/discord",
-            source: "test",
-            manifestPath: "/plugins/discord/plugin.json",
-          },
-        ],
+        manifestRecords: [plugin("discord")],
       },
     );
 
@@ -362,7 +352,7 @@ describe("channel plugin blockers", () => {
     ]);
   });
 
-  it("suppresses ambient-only package env blockers for dev gateway startup", () => {
+  it("suppresses ambient-only package env blockers for gateway startup", () => {
     mockManifestPlugins([
       plugin("discord", {
         packageChannel: createPackageChannelEnv("discord", ["DISCORD_FAKE_TEST_TRIGGER"]),
@@ -870,31 +860,9 @@ describe("channel plugin blockers", () => {
         reason: "missing explicit enablement",
       },
     ]);
-  });
-
-  it("reports a single channel owner blocked by plugins.deny", () => {
-    mockManifestPlugins([plugin("discord")]);
-
-    const hits = scanConfiguredChannelPluginBlockers({
-      plugins: {
-        deny: ["discord"],
-      },
-      channels: {
-        discord: {
-          enabled: true,
-        },
-      },
-    });
-
-    expect(hits).toEqual([
-      {
-        channelId: "discord",
-        pluginId: "discord",
-        reason: "blocked by denylist",
-      },
-    ]);
     expect(collectConfiguredChannelPluginBlockerWarnings(hits)).toEqual([
-      '- channels.discord: channel is configured, but plugin "discord" is blocked by plugins.deny. Remove "discord" from plugins.deny. Fix plugin enablement before relying on setup guidance for this channel.',
+      '- channels.shared-chat: channel is configured, but plugin "denied-chat" is blocked by plugins.deny. Remove "denied-chat" from plugins.deny. Fix plugin enablement before relying on setup guidance for this channel.',
+      '- channels.shared-chat: channel is configured, but external plugin "untrusted-chat" is installed without explicit trust. Add plugins.entries.untrusted-chat.enabled=true. Fix plugin enablement before relying on setup guidance for this channel.',
     ]);
   });
 

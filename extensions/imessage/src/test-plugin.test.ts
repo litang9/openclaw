@@ -6,7 +6,6 @@ import {
   createMessageReceiptFromOutboundResults,
   sendDurableMessageBatch,
   verifyChannelMessageAdapterCapabilityProofs,
-  verifyDurableFinalCapabilityProofs,
 } from "openclaw/plugin-sdk/channel-outbound";
 import {
   createTestRegistry,
@@ -15,66 +14,27 @@ import {
 } from "openclaw/plugin-sdk/channel-test-helpers";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { drainPendingDeliveries } from "openclaw/plugin-sdk/delivery-queue-runtime";
-import {
-  listImportedBundledPluginFacadeIds,
-  resetFacadeRuntimeStateForTest,
-} from "openclaw/plugin-sdk/plugin-test-runtime";
 import { withStateDirEnv } from "openclaw/plugin-sdk/test-env";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearIMessageApprovalReactionTargetsForTest,
   resolveIMessageApprovalReactionTargetWithPersistence,
 } from "./approval-reactions.js";
 import { imessagePlugin } from "./channel.js";
 import type { IMessageRpcClient } from "./client.js";
-import { createIMessageTestPlugin } from "./imessage.test-plugin.js";
 import { extractMarkdownFormatRuns } from "./markdown-format.js";
 import { sendMessageIMessage } from "./send.js";
 
 beforeEach(() => {
-  resetFacadeRuntimeStateForTest();
   clearIMessageApprovalReactionTargetsForTest();
 });
 
-afterEach(() => {
-  resetFacadeRuntimeStateForTest();
-});
-
-type IMessageOutbound = NonNullable<ReturnType<typeof createIMessageTestPlugin>["outbound"]>;
 type IMessageMessageAdapter = NonNullable<typeof imessagePlugin.message>;
 type IMessageMessageSender = NonNullable<IMessageMessageAdapter["send"]>;
 const IMESSAGE_WORKSPACE_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=",
   "base64",
 );
-
-function requireOutbound(): IMessageOutbound {
-  const outbound = createIMessageTestPlugin().outbound;
-  if (!outbound) {
-    throw new Error("Expected iMessage test plugin outbound adapter");
-  }
-  return outbound;
-}
-
-function requireOutboundSendText(
-  outbound: IMessageOutbound,
-): NonNullable<IMessageOutbound["sendText"]> {
-  const sendText = outbound.sendText;
-  if (!sendText) {
-    throw new Error("Expected iMessage outbound sendText");
-  }
-  return sendText;
-}
-
-function requireOutboundSendMedia(
-  outbound: IMessageOutbound,
-): NonNullable<IMessageOutbound["sendMedia"]> {
-  const sendMedia = outbound.sendMedia;
-  if (!sendMedia) {
-    throw new Error("Expected iMessage outbound sendMedia");
-  }
-  return sendMedia;
-}
 
 function requireMessageAdapter(): IMessageMessageAdapter {
   const adapter = imessagePlugin.message;
@@ -104,30 +64,47 @@ function requireMessageSendMedia(
   return media;
 }
 
-describe("createIMessageTestPlugin", () => {
-  it("does not load the bundled iMessage facade by default", () => {
-    expect(listImportedBundledPluginFacadeIds()).toStrictEqual([]);
+describe("imessagePlugin contracts", () => {
+  it("tells the model to omit redacted current-conversation targets", () => {
+    const hints = imessagePlugin.agentPrompt?.messageToolHints?.({
+      cfg: {},
+      accountId: "default",
+    });
 
-    createIMessageTestPlugin();
-
-    expect(listImportedBundledPluginFacadeIds()).toStrictEqual([]);
+    expect(hints?.join("\n")).toContain("omit target");
+    expect(hints?.join("\n")).toContain("never copy a redacted display value");
   });
 
-  it("normalizes repeated transport prefixes without recursive stack growth", () => {
-    const plugin = createIMessageTestPlugin();
-    const prefixedHandle = `${"imessage:".repeat(5000)}+44 20 7946 0958`;
+  it("rejects unqualified provider identifiers and exposes qualification guidance", async () => {
+    const targetResolver = imessagePlugin.messaging?.targetResolver;
+    const resolveTarget = targetResolver?.resolveTarget;
+    if (!resolveTarget) {
+      throw new Error("Expected iMessage target resolver");
+    }
 
-    expect(plugin.messaging?.normalizeTarget?.(prefixedHandle)).toBe("+442079460958");
+    expect(targetResolver.hint).toBe(
+      "<phone|email|chat_id:ID|auto:contact|imessage:contact|sms:contact>",
+    );
+
+    await expect(
+      resolveTarget({
+        cfg: {} as OpenClawConfig,
+        input: "C0AG22RN7L3",
+        normalized: "+02273",
+      }),
+    ).resolves.toBeNull();
+
+    await expect(
+      resolveTarget({
+        cfg: {} as OpenClawConfig,
+        input: "auto:Alice Smith",
+        normalized: "auto:AliceSmith",
+      }),
+    ).resolves.toMatchObject({ kind: "user", to: "auto:AliceSmith" });
   });
 
   it("declares durable final delivery capabilities", () => {
     expect(imessagePlugin.outbound?.deliveryCapabilities?.durableFinal).toStrictEqual({
-      text: true,
-      media: true,
-      replyTo: true,
-      messageSendingHooks: true,
-    });
-    expect(createIMessageTestPlugin().outbound?.deliveryCapabilities?.durableFinal).toStrictEqual({
       text: true,
       media: true,
       replyTo: true,
@@ -256,56 +233,6 @@ describe("createIMessageTestPlugin", () => {
       approvalId: "exec-shared-hook",
       approvalKind: "exec",
       decision: "allow-once",
-    });
-  });
-
-  it("backs declared durable final capabilities with delivery proofs", async () => {
-    const outbound = requireOutbound();
-    const sendText = requireOutboundSendText(outbound);
-    const sendMedia = requireOutboundSendMedia(outbound);
-    const sendIMessage = async () => ({ messageId: "imsg-1" });
-
-    await verifyDurableFinalCapabilityProofs({
-      adapterName: "imessageOutbound",
-      capabilities: outbound.deliveryCapabilities?.durableFinal,
-      proofs: {
-        text: async () => {
-          await expect(
-            sendText({
-              cfg: {} as never,
-              to: "+15551234567",
-              text: "hello",
-              deps: { imessage: sendIMessage },
-            }),
-          ).resolves.toEqual({ channel: "imessage", messageId: "imsg-1" });
-        },
-        media: async () => {
-          await expect(
-            sendMedia({
-              cfg: {} as never,
-              to: "+15551234567",
-              text: "caption",
-              mediaUrl: "/tmp/image.png",
-              mediaLocalRoots: ["/tmp"],
-              deps: { imessage: sendIMessage },
-            }),
-          ).resolves.toEqual({ channel: "imessage", messageId: "imsg-1" });
-        },
-        replyTo: async () => {
-          await expect(
-            sendText({
-              cfg: {} as never,
-              to: "+15551234567",
-              text: "reply",
-              replyToId: "reply-1",
-              deps: { imessage: sendIMessage },
-            }),
-          ).resolves.toEqual({ channel: "imessage", messageId: "imsg-1" });
-        },
-        messageSendingHooks: () => {
-          expect(sendText).toBeTypeOf("function");
-        },
-      },
     });
   });
 
@@ -465,34 +392,39 @@ describe("createIMessageTestPlugin", () => {
       filename: "../outside.png",
       contents: IMESSAGE_WORKSPACE_PNG,
       readerCalls: 0,
+      expectedCode: "path-not-allowed",
     },
     {
       name: "private log document",
       filename: "debug.log",
       contents: Buffer.from("private operator logs"),
       readerCalls: 1,
+      expectedCode: "path-not-allowed",
     },
     {
       name: "untrusted HTML before the host reader",
       filename: "report.html",
       contents: Buffer.from("<!doctype html><h1>untrusted</h1>"),
       readerCalls: 0,
+      expectedCode: "path-not-allowed",
     },
     {
       name: "plain text disguised as a PDF",
       filename: "report.pdf",
       contents: Buffer.from("private text without a PDF signature"),
       readerCalls: 1,
+      expectedCode: "path-not-allowed",
     },
     {
       name: "binary data disguised as plain text",
       filename: "report.txt",
       contents: Buffer.from([0x50, 0x4b, 0x03, 0x04]),
       readerCalls: 1,
+      expectedCode: "path-not-allowed",
     },
   ])(
     "rejects $name before native iMessage delivery",
-    async ({ filename, contents, readerCalls }) => {
+    async ({ filename, contents, readerCalls, expectedCode }) => {
       await withStateDirEnv("openclaw-imessage-media-policy-", async ({ stateDir }) => {
         const stateRoot = fs.realpathSync(stateDir);
         const workspaceDir = path.join(stateRoot, "workspace");
@@ -518,7 +450,7 @@ describe("createIMessageTestPlugin", () => {
           } as Parameters<typeof sendMedia>[0] & {
             deps: { imessage: typeof nativeSend };
           }),
-        ).rejects.toMatchObject({ code: "path-not-allowed" });
+        ).rejects.toMatchObject({ code: expectedCode });
 
         expect(readFile).toHaveBeenCalledTimes(readerCalls);
         expect(conflictingReader).not.toHaveBeenCalled();
@@ -598,7 +530,7 @@ describe("createIMessageTestPlugin", () => {
         const result = await sendDurableMessageBatch({
           cfg,
           channel: "imessage",
-          to: "imessage:+15550004567",
+          to: "+15550004567",
           durability: "required",
           mediaAccess,
           deps: { imessage: nativeSend },
@@ -678,7 +610,7 @@ describe("createIMessageTestPlugin", () => {
         const result = await sendDurableMessageBatch({
           cfg,
           channel: "imessage",
-          to: "imessage:+15550004567",
+          to: "+15550004567",
           durability: "required",
           mediaAccess: { localRoots: [workspaceDir], workspaceDir, readFile },
           deps: { imessage: nativeSend },
@@ -704,23 +636,5 @@ describe("createIMessageTestPlugin", () => {
     } finally {
       resetPluginRuntimeStateForTest();
     }
-  });
-
-  it("exposes seeded private API actions for binding contract tests", () => {
-    const plugin = createIMessageTestPlugin();
-
-    expect(plugin.actions?.describeMessageTool({} as never)?.actions).toStrictEqual([
-      "react",
-      "edit",
-      "unsend",
-      "reply",
-      "sendWithEffect",
-      "upload-file",
-      "renameGroup",
-      "setGroupIcon",
-      "addParticipant",
-      "removeParticipant",
-      "leaveGroup",
-    ]);
   });
 });

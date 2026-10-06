@@ -1,20 +1,15 @@
+import { resolveChannelAccount } from "../../channels/account-resolution.js";
 import { findBundledChannelCatalogMetadata } from "../../channels/bundled-channel-catalog-read.js";
-// Doctor capability lookup for channel-specific policy and migration behavior.
 import { getBundledChannelPlugin } from "../../channels/plugins/bundled.js";
-import type { ChannelDmAllowFromMode } from "../../channels/plugins/dm-access.js";
 import { getChannelPlugin } from "../../channels/plugins/index.js";
 import { normalizeAnyChannelId } from "../../channels/registry.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { PluginPackageChannelDoctorCapabilities } from "../../plugins/manifest.js";
 
-type DoctorGroupModel = "sender" | "route" | "hybrid";
-
-type DoctorChannelCapabilities = {
-  dmAllowFromMode: ChannelDmAllowFromMode;
-  groupModel: DoctorGroupModel;
-  groupAllowFromFallbackToAllowFrom: boolean;
-  warnOnEmptyGroupSenderAllowlist: boolean;
-};
+type DoctorChannelCapabilities = Required<
+  Omit<PluginPackageChannelDoctorCapabilities, "openDmRequiresAllowFromWildcard">
+> &
+  Pick<PluginPackageChannelDoctorCapabilities, "openDmRequiresAllowFromWildcard">;
 
 const DEFAULT_DOCTOR_CHANNEL_CAPABILITIES: DoctorChannelCapabilities = {
   dmAllowFromMode: "topOnly",
@@ -29,6 +24,9 @@ function mergeDoctorChannelCapabilities(
   return {
     dmAllowFromMode:
       capabilities?.dmAllowFromMode ?? DEFAULT_DOCTOR_CHANNEL_CAPABILITIES.dmAllowFromMode,
+    ...(typeof capabilities?.openDmRequiresAllowFromWildcard === "boolean"
+      ? { openDmRequiresAllowFromWildcard: capabilities.openDmRequiresAllowFromWildcard }
+      : {}),
     groupModel: capabilities?.groupModel ?? DEFAULT_DOCTOR_CHANNEL_CAPABILITIES.groupModel,
     groupAllowFromFallbackToAllowFrom:
       capabilities?.groupAllowFromFallbackToAllowFrom ??
@@ -39,19 +37,12 @@ function mergeDoctorChannelCapabilities(
   };
 }
 
-function getCatalogDoctorCapabilities(
-  channelId: string,
-): PluginPackageChannelDoctorCapabilities | undefined {
-  return findBundledChannelCatalogMetadata(channelId)?.doctorCapabilities;
-}
-
-/** Resolve doctor behavior capabilities from channel metadata, plugin runtime, or defaults. */
 export function getDoctorChannelCapabilities(channelName?: string): DoctorChannelCapabilities {
   if (!channelName) {
     return DEFAULT_DOCTOR_CHANNEL_CAPABILITIES;
   }
 
-  const catalogCapabilities = getCatalogDoctorCapabilities(channelName);
+  const catalogCapabilities = findBundledChannelCatalogMetadata(channelName)?.doctorCapabilities;
   if (catalogCapabilities) {
     return mergeDoctorChannelCapabilities(catalogCapabilities);
   }
@@ -65,7 +56,9 @@ export function getDoctorChannelCapabilities(channelName?: string): DoctorChanne
   if (pluginDoctor) {
     return mergeDoctorChannelCapabilities(pluginDoctor);
   }
-  return mergeDoctorChannelCapabilities(getCatalogDoctorCapabilities(channelId));
+  return mergeDoctorChannelCapabilities(
+    findBundledChannelCatalogMetadata(channelId)?.doctorCapabilities,
+  );
 }
 
 type DoctorChannelAccountIds = {
@@ -82,11 +75,11 @@ function readResolvedAccountId(account: unknown): string | undefined {
 }
 
 /** Resolve configured and runtime account ids through the channel plugin's own semantics. */
-export function resolveDoctorChannelAccountIds(
+export async function resolveDoctorChannelAccountIds(
   channelName: string,
   cfg: OpenClawConfig,
   configuredAccountIds: string[],
-): DoctorChannelAccountIds | undefined {
+): Promise<DoctorChannelAccountIds | undefined> {
   const channelId = normalizeAnyChannelId(channelName);
   if (!channelId) {
     return undefined;
@@ -96,16 +89,18 @@ export function resolveDoctorChannelAccountIds(
     if (!plugin) {
       return undefined;
     }
-    const resolveAccountIds = (accountIds: string[]): string[] | undefined => {
-      const resolved = accountIds.map((accountId) =>
-        readResolvedAccountId(plugin.config.resolveAccount(cfg, accountId)),
+    const resolveAccountIds = async (accountIds: string[]): Promise<string[] | undefined> => {
+      const resolved = await Promise.all(
+        accountIds.map(async (accountId) =>
+          readResolvedAccountId(await resolveChannelAccount({ plugin, cfg, accountId })),
+        ),
       );
       return resolved.every((accountId): accountId is string => accountId !== undefined)
         ? resolved
         : undefined;
     };
-    const configured = resolveAccountIds(configuredAccountIds);
-    const runtime = resolveAccountIds(plugin.config.listAccountIds(cfg));
+    const configured = await resolveAccountIds(configuredAccountIds);
+    const runtime = await resolveAccountIds(plugin.config.listAccountIds(cfg));
     return configured && runtime ? { configured, runtime } : undefined;
   } catch {
     // Keep doctor warnings conservative when a plugin cannot inspect its account set.

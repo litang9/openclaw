@@ -1,12 +1,19 @@
 import { asNullableRecord as asRecord } from "@openclaw/normalization-core/record-coerce";
+import { readNonBlankString } from "@openclaw/normalization-core/string-coerce";
 import {
   MAX_DIFF_RENDER_LINES,
+  splitDiffLines,
+  type DiffFilePaths,
   type DiffLine,
   type DiffLineKind,
   type DiffStat,
 } from "./tool-call-diff.ts";
 
 type PatchOperation = "add" | "delete" | "update";
+
+export type PatchFileOperation = DiffFilePaths & {
+  operation: PatchOperation;
+};
 
 type PatchSection = {
   operation: PatchOperation;
@@ -31,25 +38,11 @@ type HunkState = {
 
 type PatchViewData = {
   paths: string[];
+  fileOperations: PatchFileOperation[];
   lines: DiffLine[];
   stat: DiffStat;
   move?: { from: string; to: string };
 };
-
-function readString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value : undefined;
-}
-
-function splitLines(text: string): string[] {
-  if (text === "") {
-    return [];
-  }
-  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-  if (lines.length > 1 && lines.at(-1) === "") {
-    lines.pop();
-  }
-  return lines;
-}
 
 function startSection(
   collector: PatchCollector,
@@ -106,43 +99,27 @@ function pushHunkLine(
   collector: PatchCollector,
   section: PatchSection,
   raw: string,
-  hunk: HunkState,
-): void {
-  let kind: DiffLineKind;
-  let lineNo: number | undefined;
-  if (raw.startsWith("+")) {
-    kind = "add";
-    lineNo = hunk.newLine;
-    if (hunk.newLine !== undefined) {
-      hunk.newLine += 1;
-      hunk.newLeft = Math.max(0, (hunk.newLeft ?? 0) - 1);
-    }
-  } else if (raw.startsWith("-")) {
-    kind = "del";
-    lineNo = hunk.oldLine;
-    if (hunk.oldLine !== undefined) {
+  hunk: HunkState | null,
+): HunkState | null {
+  const kind: DiffLineKind = raw.startsWith("+") ? "add" : raw.startsWith("-") ? "del" : "ctx";
+  const lineNo = kind === "del" ? hunk?.oldLine : hunk?.newLine;
+  // Context consumes both sides together; unnumbered patch hunks keep both absent.
+  if (hunk && (kind !== "ctx" || (hunk.oldLine !== undefined && hunk.newLine !== undefined))) {
+    if (kind !== "add" && hunk.oldLine !== undefined) {
       hunk.oldLine += 1;
       hunk.oldLeft = Math.max(0, (hunk.oldLeft ?? 0) - 1);
     }
-  } else {
-    kind = "ctx";
-    lineNo = hunk.newLine;
-    if (hunk.oldLine !== undefined && hunk.newLine !== undefined) {
-      hunk.oldLine += 1;
+    if (kind !== "del" && hunk.newLine !== undefined) {
       hunk.newLine += 1;
-      hunk.oldLeft = Math.max(0, (hunk.oldLeft ?? 0) - 1);
       hunk.newLeft = Math.max(0, (hunk.newLeft ?? 0) - 1);
     }
   }
   pushLine(collector, section, {
     kind,
     ...(lineNo !== undefined ? { lineNo } : {}),
-    text: raw === "" ? "" : raw.slice(1),
+    text: raw.slice(1),
   });
-}
-
-function hunkComplete(hunk: HunkState): boolean {
-  return hunk.oldLeft !== undefined && hunk.oldLeft === 0 && hunk.newLeft === 0;
+  return hunk?.oldLeft === 0 && hunk.newLeft === 0 ? null : hunk;
 }
 
 function sectionLabel(section: PatchSection): string {
@@ -159,6 +136,11 @@ function finish(collector: PatchCollector): PatchViewData | null {
     return null;
   }
   const paths = [...new Set(collector.sections.map((section) => section.path).filter(Boolean))];
+  const fileOperations = collector.sections.map(({ operation, path, sourcePath }) => ({
+    operation,
+    path,
+    ...(operation === "update" && sourcePath !== path ? { oldPath: sourcePath } : {}),
+  }));
   const stat = collector.sections.reduce(
     (sum, section) => ({
       added: sum.added + section.stat.added,
@@ -175,12 +157,17 @@ function finish(collector: PatchCollector): PatchViewData | null {
       clipped = true;
     }
   };
-  for (const section of collector.sections) {
+  for (const [index, section] of collector.sections.entries()) {
     if (collector.sections.length > 1) {
       if (lines.length > 0 && lines.at(-1)?.kind !== "skip") {
         append({ kind: "skip", text: "" });
       }
-      append({ kind: "file", text: sectionLabel(section) });
+      append({
+        kind: "file",
+        path: section.path,
+        ...("oldPath" in fileOperations[index]! ? { oldPath: section.sourcePath } : {}),
+        text: sectionLabel(section),
+      });
     }
     for (const line of section.lines) {
       append(line);
@@ -194,29 +181,24 @@ function finish(collector: PatchCollector): PatchViewData | null {
     only && only.operation === "update" && only.sourcePath !== only.path
       ? { from: only.sourcePath, to: only.path }
       : undefined;
-  return { paths, lines, stat, ...(move ? { move } : {}) };
+  return { paths, fileOperations, lines, stat, ...(move ? { move } : {}) };
 }
 
 function parseCodexPatch(text: string): PatchViewData | null {
   const collector: PatchCollector = { sections: [], storedRows: 0, truncated: false };
   let current: PatchSection | null = null;
-  let mode: PatchOperation | "outside" = "outside";
   let hunk: HunkState | null = null;
-  for (const raw of splitLines(text)) {
-    const structural = mode === "update" ? raw.trimEnd() : raw.trim();
+  for (const raw of splitDiffLines(text)) {
+    const structural = current?.operation === "update" ? raw.trimEnd() : raw.trim();
     const fileMatch = structural.match(/^\*\*\* (Update|Add|Delete) File: (.+)$/);
     if (fileMatch) {
-      const operation = fileMatch[1];
-      const path = fileMatch[2];
-      if (!operation || !path) {
-        continue;
-      }
-      mode = operation.toLowerCase() as PatchOperation;
-      current = startSection(collector, mode, path);
+      const operation = fileMatch[1]!.toLowerCase() as PatchOperation;
+      current = startSection(collector, operation, fileMatch[2]!);
       hunk = null;
       continue;
     }
-    const moveMatch = mode === "update" ? structural.match(/^\*\*\* Move to: (.+)$/) : null;
+    const moveMatch =
+      current?.operation === "update" ? structural.match(/^\*\*\* Move to: (.+)$/) : null;
     if (moveMatch && current) {
       current.path = moveMatch[1]?.trim() ?? current.path;
       continue;
@@ -232,26 +214,22 @@ function parseCodexPatch(text: string): PatchViewData | null {
     if (!current) {
       continue;
     }
-    if (mode === "update" && raw.startsWith("@@")) {
+    if (current.operation === "update" && raw.startsWith("@@")) {
       separateHunk(collector, current);
       hunk = parseHunkHeader(raw);
       continue;
     }
-    if (mode === "add" && raw.startsWith("+")) {
+    if (current.operation === "add" && raw.startsWith("+")) {
       pushLine(collector, current, {
         kind: "add",
         lineNo: current.stat.added + 1,
         text: raw.slice(1),
       });
     } else if (
-      mode === "update" &&
+      current.operation === "update" &&
       (raw === "" || raw.startsWith("+") || raw.startsWith("-") || raw.startsWith(" "))
     ) {
-      const activeHunk = hunk ?? {};
-      pushHunkLine(collector, current, raw, activeHunk);
-      if (hunk && hunkComplete(hunk)) {
-        hunk = null;
-      }
+      hunk = pushHunkLine(collector, current, raw, hunk);
     }
   }
   return finish(collector);
@@ -284,24 +262,16 @@ function applyHeaderPair(
 
 function parseUnifiedPatch(text: string): PatchViewData | null {
   const collector: PatchCollector = { sections: [], storedRows: 0, truncated: false };
-  const rawLines = splitLines(text);
+  const rawLines = splitDiffLines(text);
   let current: PatchSection | null = null;
   let hunk: HunkState | null = null;
   let awaitingGitHeaders = false;
   for (let index = 0; index < rawLines.length; index++) {
-    const raw = rawLines[index];
-    if (raw === undefined) {
-      continue;
-    }
+    const raw = rawLines[index]!;
     const gitHeader = raw.match(/^diff --git a\/(.+) b\/(.+)$/);
     if (gitHeader) {
-      const sourcePath = gitHeader[1];
-      const path = gitHeader[2];
-      if (!sourcePath || !path) {
-        continue;
-      }
-      current = startSection(collector, "update", path);
-      current.sourcePath = sourcePath;
+      current = startSection(collector, "update", gitHeader[2]!);
+      current.sourcePath = gitHeader[1]!;
       hunk = null;
       awaitingGitHeaders = true;
       continue;
@@ -325,10 +295,7 @@ function parseUnifiedPatch(text: string): PatchViewData | null {
       continue;
     }
     if (current && hunk && (raw.startsWith("+") || raw.startsWith("-") || raw.startsWith(" "))) {
-      pushHunkLine(collector, current, raw, hunk);
-      if (hunkComplete(hunk)) {
-        hunk = null;
-      }
+      hunk = pushHunkLine(collector, current, raw, hunk);
     }
   }
   return finish(collector);
@@ -354,15 +321,12 @@ function appendStructuredUpdate(
   diff: string,
 ): void {
   let hunk: HunkState | null = null;
-  for (const raw of splitLines(diff)) {
+  for (const raw of splitDiffLines(diff)) {
     if (raw.startsWith("@@")) {
       separateHunk(collector, section);
       hunk = parseHunkHeader(raw);
     } else if (hunk && (raw.startsWith("+") || raw.startsWith("-") || raw.startsWith(" "))) {
-      pushHunkLine(collector, section, raw, hunk);
-      if (hunkComplete(hunk)) {
-        hunk = null;
-      }
+      hunk = pushHunkLine(collector, section, raw, hunk);
     }
   }
 }
@@ -371,13 +335,13 @@ function parseStructuredPatch(changes: unknown[]): PatchViewData | null {
   const collector: PatchCollector = { sections: [], storedRows: 0, truncated: false };
   for (const value of changes) {
     const record = asRecord(value);
-    const sourcePath = readString(record?.path)?.trim();
+    const sourcePath = readNonBlankString(record?.path)?.trim();
     if (!record || !sourcePath) {
       continue;
     }
     const operation = readOperation(record.kind);
     const section = startSection(collector, operation, sourcePath);
-    const movePath = readString(
+    const movePath = readNonBlankString(
       asRecord(record.kind)?.move_path ?? asRecord(record.kind)?.movePath,
     );
     if (movePath) {
@@ -388,7 +352,7 @@ function parseStructuredPatch(changes: unknown[]): PatchViewData | null {
         appendStructuredUpdate(collector, section, record.diff);
       } else {
         const kind = operation === "add" ? "add" : "del";
-        for (const [index, text] of splitLines(record.diff).entries()) {
+        for (const [index, text] of splitDiffLines(record.diff).entries()) {
           pushLine(collector, section, { kind, lineNo: index + 1, text });
         }
       }
@@ -413,7 +377,10 @@ export function parsePatchView(args: unknown): PatchViewData | null {
       return structured;
     }
   }
-  const text = readString(record.patch) ?? readString(record.input) ?? readString(record.diff);
+  const text =
+    readNonBlankString(record.patch) ??
+    readNonBlankString(record.input) ??
+    readNonBlankString(record.diff);
   if (!text) {
     return null;
   }

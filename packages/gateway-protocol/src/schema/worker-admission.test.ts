@@ -1,6 +1,7 @@
 import { Value } from "typebox/value";
 import { describe, expect, it } from "vitest";
 import { GATEWAY_CLIENT_IDS, GATEWAY_CLIENT_MODES } from "../client-info.js";
+import { FAILOVER_REASONS } from "../failover-reasons.js";
 import {
   type WorkerAdmissionHandshake,
   WorkerAdmissionResponseFrameSchema,
@@ -11,6 +12,7 @@ import {
   WorkerProtocolCloseReasonSchema,
   WorkerTranscriptCommitRequestFrameSchema,
   WorkerTranscriptCommitResponseFrameSchema,
+  WORKER_PROVIDER_REPLAY_MAX_DATA_BYTES,
   WORKER_LAUNCH_V2_PROTOCOL_FEATURE,
   WORKER_PROTOCOL_FEATURES,
   WORKER_RPC_SET_VERSION,
@@ -21,10 +23,13 @@ import {
   validateWorkerLiveEventParams,
   validateWorkerTranscriptCommitParams,
 } from "../index.js";
+import { WorkerGatewayToolResultSchema } from "./worker-gateway-tool.js";
 import {
   WORKER_INFERENCE_MAX_OUTPUT_TOKENS,
+  validateWorkerInferenceEventFrame,
   validateWorkerInferenceStartParams,
 } from "./worker-inference.js";
+import { WORKER_PROTOCOL_MAX_PAYLOAD_BYTES } from "./worker-protocol-primitives.js";
 
 const bundleHash = "a".repeat(64);
 const handshake: WorkerAdmissionHandshake = {
@@ -161,12 +166,22 @@ const approval = (phase: string, status: string) =>
   event("approval", { phase, kind: "exec", status, title: "x" });
 const lifecycle = (phase: string, payload: Record<string, unknown> = {}) =>
   event("lifecycle", { phase, ...payload });
-const fallbackStep = (outcome: string) =>
+const fallbackStep = (outcome: string, reason?: string) =>
   lifecycle("fallback_step", {
     fallbackStepType: "fallback_step",
     fallbackStepFromModel: "p/m",
+    ...(reason === undefined ? {} : { fallbackStepFromFailureReason: reason }),
     fallbackStepFinalOutcome: outcome,
   });
+const fallbackReasonEvents = (reason: string) => [
+  lifecycle("fallback", {
+    ...models,
+    reasonSummary: "x",
+    attemptSummaries: ["x"],
+    attempts: [{ provider: "p", model: "m", error: "x", reason }],
+  }),
+  fallbackStep("next_fallback", reason),
+];
 const assistant = event("assistant", { text: "x", delta: "x" });
 const validateLive = validateWorkerLiveEventParams;
 const liveError = (details: Record<string, unknown>) => ({
@@ -274,10 +289,79 @@ describe("worker protocol schemas", () => {
     expect(commitError("transcript commit rejected", "stale-base-leaf")).toBe(true);
   });
 
+  it("accepts opaque provider replay state on assistant transcript messages", () => {
+    const assistantMessage = transcriptMessages[1];
+    if (!assistantMessage || assistantMessage.role !== "assistant") {
+      throw new Error("expected assistant transcript fixture");
+    }
+    const providerReplay = {
+      v: 1 as const,
+      type: "openai-responses-compaction",
+      id: "cmp_worker",
+      data: "opaque-worker-compaction",
+      replayIndex: 1,
+      provider: "openai",
+      api: "openai-responses",
+      model: "gpt-5.6-luna",
+      baseUrlHash: "ozhevd1smnk8s",
+      sessionHash: "171dzdv17gum5g",
+      authProfileHash: "oe8bkr3r8947",
+    };
+    const candidate = transcriptCommit({
+      messages: [{ ...assistantMessage, providerReplay }],
+    });
+
+    expect(validateWorkerTranscriptCommitParams(candidate)).toBe(true);
+    expect(
+      validateWorkerTranscriptCommitParams({
+        ...candidate,
+        messages: [
+          {
+            ...assistantMessage,
+            providerReplay: { ...providerReplay, privateScratch: "drop" },
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      validateWorkerTranscriptCommitParams({
+        ...candidate,
+        messages: [
+          {
+            ...assistantMessage,
+            providerReplay: {
+              ...providerReplay,
+              data: "x".repeat(WORKER_PROVIDER_REPLAY_MAX_DATA_BYTES),
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      validateWorkerTranscriptCommitParams({
+        ...candidate,
+        messages: [
+          {
+            ...assistantMessage,
+            providerReplay: {
+              ...providerReplay,
+              data: "x".repeat(WORKER_PROVIDER_REPLAY_MAX_DATA_BYTES + 1),
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("advertises only the current execution-context dialect", () => {
+    expect(WORKER_PROTOCOL_FEATURES).not.toContain(WORKER_LAUNCH_V2_PROTOCOL_FEATURE);
+    expect(WORKER_PROTOCOL_FEATURES).not.toContain("worker-execution-context-v1");
+    expect(WORKER_PROTOCOL_FEATURES).toContain("worker-execution-context-v2");
+  });
+
   it("validates the additive live-event protocol", () => {
     expect(WORKER_RPC_SET_VERSION).toBe(1);
     expect(WORKER_PROTOCOL_FEATURES).toContain("worker-live-event-v1");
-    expect(WORKER_PROTOCOL_FEATURES).toContain(WORKER_LAUNCH_V2_PROTOCOL_FEATURE);
     for (const validEvent of [
       assistant,
       event("thinking", { text: "x", delta: "x" }),
@@ -351,6 +435,18 @@ describe("worker protocol schemas", () => {
     }
   });
 
+  it("keeps both worker fallback reason fields aligned with the canonical vocabulary", () => {
+    for (const reason of FAILOVER_REASONS) {
+      for (const fallbackEvent of fallbackReasonEvents(reason)) {
+        expect(validateLive(params(fallbackEvent))).toBe(true);
+      }
+    }
+
+    for (const fallbackEvent of fallbackReasonEvents("not-a-reason")) {
+      expect(validateLive(params(fallbackEvent))).toBe(false);
+    }
+  });
+
   it("accepts only a model reference and constrained inference options", () => {
     expect(
       validateWorkerInferenceStartParams({
@@ -368,6 +464,29 @@ describe("worker protocol schemas", () => {
     ]) {
       expect(validateWorkerInferenceStartParams(candidate)).toBe(false);
     }
+  });
+
+  it.each([
+    { type: "text_start", contentSignature: "signature" },
+    { type: "text_delta", delta: "text" },
+    { type: "text_end", contentSignature: "signature" },
+    { type: "thinking_start" },
+    { type: "thinking_delta", delta: "thought" },
+    { type: "thinking_end", contentSignature: "signature" },
+    { type: "toolcall_start", id: "call-1", toolName: "probe" },
+    { type: "toolcall_delta", delta: "{}" },
+    { type: "toolcall_end" },
+  ])("keeps inference content events closed and indexed: $type", (contentEvent) => {
+    const validateEvent = (value: unknown) =>
+      validateWorkerInferenceEventFrame({
+        type: "event",
+        event: "worker.inference.event",
+        payload: { ...inferenceIdentity, seq: 1, event: value },
+      });
+    expect(validateEvent({ ...contentEvent, contentIndex: 0 })).toBe(true);
+    expect(validateEvent(contentEvent)).toBe(false);
+    expect(validateEvent({ ...contentEvent, contentIndex: -1 })).toBe(false);
+    expect(validateEvent({ ...contentEvent, contentIndex: 0, unexpected: true })).toBe(false);
   });
 
   it.each([
@@ -438,8 +557,75 @@ describe("worker protocol schemas", () => {
   });
 
   it("keeps worker close reasons closed", () => {
+    expect(Value.Check(WorkerProtocolCloseReasonSchema, "admission-rejected")).toBe(true);
     expect(Value.Check(WorkerProtocolCloseReasonSchema, "credential-replaced")).toBe(true);
     expect(Value.Check(WorkerProtocolCloseReasonSchema, "placement-mismatch")).toBe(true);
     expect(Value.Check(WorkerProtocolCloseReasonSchema, "not-a-worker-reason")).toBe(false);
+  });
+});
+
+describe("worker message wire boundaries", () => {
+  it.each([
+    { content: { type: "text", text: "ok", textSignature: "" }, accepts: [false, true, true] },
+    { content: { type: "text", text: "ok", textSignature: "signed" }, accepts: [true, true, true] },
+    { content: { type: "image", data: "", mimeType: "image/png" }, accepts: [false, false, true] },
+    {
+      content: { type: "image", data: "encoded", mimeType: "image/png" },
+      accepts: [true, true, true],
+    },
+    { content: { type: "text", text: "ok", extra: true }, accepts: [false, false, false] },
+    {
+      content: { type: "text", text: "a".repeat(WORKER_PROTOCOL_MAX_PAYLOAD_BYTES + 1) },
+      accepts: [false, true, false],
+    },
+  ])("retains each transport's content limits ($accepts)", ({ content, accepts }) => {
+    const message = { role: "user", content: [content], timestamp: 1 };
+    expect([
+      validateWorkerTranscriptCommitParams(transcriptCommit({ messages: [message] })),
+      validateWorkerInferenceStartParams({ ...inferenceStart, context: { messages: [message] } }),
+      Value.Check(WorkerGatewayToolResultSchema, { content: [content] }),
+    ]).toEqual(accepts);
+  });
+
+  it("retains the inference timestamp ceiling without changing transcript admission", () => {
+    const message = {
+      role: "user",
+      content: [{ type: "text", text: "ok" }],
+      timestamp: Number.MAX_SAFE_INTEGER + 1,
+    };
+    expect(validateWorkerTranscriptCommitParams(transcriptCommit({ messages: [message] }))).toBe(
+      true,
+    );
+    expect(
+      validateWorkerInferenceStartParams({ ...inferenceStart, context: { messages: [message] } }),
+    ).toBe(false);
+  });
+
+  it("admits text-only runtime context and rejects image payloads", () => {
+    const runtimeContext = {
+      role: "user",
+      content: [{ type: "text", text: "OpenClaw runtime context:\ncurrent facts" }],
+      timestamp: 1,
+      runtimeContext: { retained: true },
+    };
+    expect(
+      validateWorkerInferenceStartParams({
+        ...inferenceStart,
+        context: { messages: [runtimeContext] },
+      }),
+    ).toBe(true);
+    expect(
+      validateWorkerInferenceStartParams({
+        ...inferenceStart,
+        context: {
+          messages: [
+            {
+              ...runtimeContext,
+              content: [{ type: "image", data: "encoded", mimeType: "image/png" }],
+            },
+          ],
+        },
+      }),
+    ).toBe(false);
   });
 });

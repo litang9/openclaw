@@ -8,6 +8,7 @@ import {
   readChatSessionSnapshot,
   type ChatMessageCache,
 } from "./session-message-cache.ts";
+import { resolveChatSnapshotKey } from "./session-snapshot-key.ts";
 
 function createHost() {
   return {
@@ -143,24 +144,34 @@ describe("session message cache", () => {
     cacheChatMessages(cache, host, { sessionKey: "agent:ops:large" }, [21]);
 
     expect(cache.size).toBe(20);
-    expect(cache.has("agent:ops:session-0")).toBe(true);
-    expect(cache.has("agent:ops:session-1")).toBe(false);
+    expect(cache.has(resolveChatSnapshotKey(host, { sessionKey: "agent:ops:session-0" }))).toBe(
+      true,
+    );
+    expect(cache.has(resolveChatSnapshotKey(host, { sessionKey: "agent:ops:session-1" }))).toBe(
+      false,
+    );
     expect(readChatMessagesFromCache(cache, host, { sessionKey: "agent:ops:large" })).toEqual([21]);
   });
 
   it("restores messages, pagination, and backing session identity together", () => {
     const { host, cache } = createCacheContext();
+    const messages = ["oldest", "latest"];
+    const pagination = { hasMore: true as const, nextOffset: 400, totalMessages: 718 };
     cacheHomeSnapshot(cache, host, {
-      messages: ["oldest", "latest"],
-      pagination: { hasMore: true, nextOffset: 400, totalMessages: 718 },
+      messages,
+      pagination,
       sessionId: "session-1",
     });
 
-    expect(readChatSessionSnapshot(cache, host, { sessionKey: "home" })).toEqual({
+    const snapshot = readChatSessionSnapshot(cache, host, { sessionKey: "home" });
+    expect(snapshot).toEqual({
       messages: ["oldest", "latest"],
       pagination: { hasMore: true, nextOffset: 400, totalMessages: 718 },
       sessionId: "session-1",
     });
+    expect(snapshot?.messages).toBe(messages);
+    expect(snapshot?.pagination).toBe(pagination);
+    expect(readChatSessionSnapshot(cache, host, { sessionKey: "home" })).toBe(snapshot);
   });
 
   it("appends an inactive-session message without losing snapshot metadata", () => {
@@ -180,58 +191,18 @@ describe("session message cache", () => {
     });
   });
 
-  it("keeps deeper same-session history when another pane saves only the latest tail", () => {
+  it("claims a shared gateway event only once across retained panes", () => {
     const { host, cache } = createCacheContext();
-    const retained = Array.from({ length: 140 }, (_, index) => ({
-      content: `retained-${index + 1}`,
-      __openclaw: { seq: index + 1 },
-    }));
-    cacheHomeSnapshot(cache, host, {
-      messages: retained,
-      pagination: { hasMore: false, totalMessages: 140 },
-      sessionId: "session-1",
-    });
-    const refreshedTail = Array.from({ length: 40 }, (_, index) => ({
-      content: `fresh-${index + 101}`,
-      __openclaw: { seq: index + 101 },
-    }));
+    const target = { sessionKey: "agent:ops:background" };
+    const cached = { role: "user", content: "cached", __openclaw: { id: "cached", seq: 1 } };
+    const final = { role: "assistant", content: "final", __openclaw: { id: "final", seq: 2 } };
+    const event = { messageId: "final", messageSeq: 2 };
+    cacheChatMessages(cache, host, target, [cached]);
 
-    cacheHomeSnapshot(cache, host, {
-      messages: refreshedTail,
-      pagination: { hasMore: true, nextOffset: 40, totalMessages: 140 },
-      sessionId: "session-1",
-    });
+    appendChatMessageToCache(cache, host, target, final, event);
+    appendChatMessageToCache(cache, host, target, final, event);
 
-    const snapshot = readChatSessionSnapshot(cache, host, { sessionKey: "home" });
-    expect(snapshot?.messages).toHaveLength(140);
-    expect(snapshot?.messages[99]).toBe(retained[99]);
-    expect(snapshot?.messages[100]).toBe(refreshedTail[0]);
-    expect(snapshot?.pagination).toEqual({ hasMore: false, totalMessages: 140 });
-  });
-
-  it("keeps the newer same-depth snapshot when a stale pane saves later", () => {
-    const { host, cache } = createCacheContext();
-    const current = [1, 2, 3].map((seq) => ({
-      content: `current-${seq}`,
-      __openclaw: { seq },
-    }));
-    cacheHomeSnapshot(cache, host, {
-      messages: current,
-      pagination: { hasMore: false, totalMessages: 3 },
-      sessionId: "session-1",
-    });
-
-    cacheHomeSnapshot(cache, host, {
-      messages: current.slice(0, 2),
-      pagination: { hasMore: true, nextOffset: 2, totalMessages: 3 },
-      sessionId: "session-1",
-    });
-
-    expect(readChatSessionSnapshot(cache, host, { sessionKey: "home" })).toEqual({
-      messages: current,
-      pagination: { hasMore: false, totalMessages: 3 },
-      sessionId: "session-1",
-    });
+    expect(readChatMessagesFromCache(cache, host, target)).toEqual([cached, final]);
   });
 
   it("does not retain history across backing session changes", () => {

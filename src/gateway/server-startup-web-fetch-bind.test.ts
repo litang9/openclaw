@@ -4,7 +4,8 @@
 import http from "node:http";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import { getFreePort, installGatewayTestHooks, startGatewayServer } from "./test-helpers.js";
+import { acquireTestPortBlock } from "../test-utils/port-claims.js";
+import { installGatewayTestHooks, startTestGatewayServer } from "./test-helpers.js";
 import { readClientResponseBody } from "./test-http-response.js";
 
 const webFetchProviderDiscovery = vi.hoisted(() => ({
@@ -19,6 +20,7 @@ const webFetchProviderDiscovery = vi.hoisted(() => ({
 // This boundary proves that credential-free web fetch config reaches the HTTP
 // listener. Model publication, chat metadata, and orphan recovery have dedicated owners.
 vi.mock("../agents/prepared-model-runtime.js", () => ({
+  cancelPreparedModelRuntimeRefresh: vi.fn(),
   publishPreparedModelRuntimeSnapshot: vi.fn(async () => ({})),
   refreshPreparedModelRuntimeSnapshots: vi.fn(async () => {}),
 }));
@@ -33,7 +35,7 @@ vi.mock("./server-chat-metadata-lifecycle.js", () => ({
   })),
 }));
 
-vi.mock("../agents/main-session-restart-recovery-marking.js", () => ({
+vi.mock("../agents/main-session-recovery/main-session-restart-recovery-marking.js", () => ({
   markStartupOrphanedMainSessionsForRecovery: vi.fn(async () => ({ marked: 0, skipped: 0 })),
 }));
 
@@ -94,7 +96,7 @@ async function writeConfig(config: OpenClawConfig): Promise<void> {
 describe("gateway startup web fetch config", () => {
   let port: number;
   let previousMinimal: string | undefined;
-  let server: Awaited<ReturnType<typeof startGatewayServer>> | undefined;
+  let server: Awaited<ReturnType<typeof startTestGatewayServer>> | undefined;
 
   beforeAll(async () => {
     previousMinimal = process.env.OPENCLAW_TEST_MINIMAL_GATEWAY;
@@ -121,8 +123,9 @@ describe("gateway startup web fetch config", () => {
       },
     } as OpenClawConfig);
 
-    port = await getFreePort();
-    server = await startGatewayServer(port, {
+    const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
+    port = portClaim.port;
+    server = await startTestGatewayServer(portClaim, {
       auth: { mode: "none" },
     });
   });

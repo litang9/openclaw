@@ -6,17 +6,23 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resetCommandQueueStateForTest } from "../../process/command-queue.test-support.js";
-import { closeOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
+import { closeOpenClawStateDatabaseAsync } from "../../state/openclaw-state-db.js";
 import { SystemAgentChatEngine } from "../../system-agent/chat-engine.js";
 import { SystemAgentInferenceUnavailableError } from "../../system-agent/inference-error.js";
 import { createSystemAgentVerifiedInferenceTestFixture } from "../../system-agent/system-agent.test-helpers.js";
-import { appendTranscriptTurn, readTranscriptTail } from "../../system-agent/transcript-store.js";
-import { withTempDir } from "../../test-helpers/temp-dir.js";
+import {
+  createSystemAgentTranscriptStore,
+  readTranscriptTailAsync,
+} from "../../system-agent/transcript-store.js";
+import { withTestDir } from "../../test-helpers/temp-dir.js";
 import { systemAgentHandlers, type SystemAgentChatSession } from "./system-agent.js";
 import type { GatewayClient, GatewayRequestContext } from "./types.js";
 
-const setupInferenceMocks = vi.hoisted(() => ({ verifySetupInference: vi.fn() }));
+const inferenceFallbackMocks = vi.hoisted(() => ({
+  verifySystemAgentInferenceWithFallback: vi.fn(),
+}));
 const greetingMocks = vi.hoisted(() => ({
+  createSystemAgentGreetingCache: () => ({ assertCurrent: () => undefined }),
   acknowledgeSystemAgentGreetingDelivery: vi.fn(),
   buildSystemAgentGreetingQuestion: vi.fn(() => undefined),
   loadSystemAgentGreetingFacts: vi.fn(() => ({
@@ -28,8 +34,9 @@ const greetingMocks = vi.hoisted(() => ({
   resolveSystemAgentGreeting: vi.fn(async () => ({ text: "welcome text", source: "template" })),
 }));
 
-vi.mock("../../system-agent/setup-inference.js", () => ({
-  verifySetupInference: setupInferenceMocks.verifySetupInference,
+vi.mock("../../system-agent/inference-fallback.js", () => ({
+  verifySystemAgentInferenceWithFallback:
+    inferenceFallbackMocks.verifySystemAgentInferenceWithFallback,
 }));
 // The transcript store is deliberately NOT mocked: the boundary under test is
 // what survives in the durable store. Only the caretaker greeting is stubbed so
@@ -55,7 +62,7 @@ const originalStateDir = process.env.OPENCLAW_STATE_DIR;
 
 beforeEach(async () => {
   const fixture = await createSystemAgentVerifiedInferenceTestFixture(verifiedConfig);
-  setupInferenceMocks.verifySetupInference.mockResolvedValue({
+  inferenceFallbackMocks.verifySystemAgentInferenceWithFallback.mockResolvedValue({
     ok: true,
     modelRef: "openai/gpt-5.5",
     latencyMs: 10,
@@ -63,10 +70,10 @@ beforeEach(async () => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
-  setupInferenceMocks.verifySetupInference.mockReset();
-  closeOpenClawStateDatabase();
+  inferenceFallbackMocks.verifySystemAgentInferenceWithFallback.mockReset();
+  await closeOpenClawStateDatabaseAsync();
   if (originalStateDir === undefined) {
     delete process.env.OPENCLAW_STATE_DIR;
   } else {
@@ -109,9 +116,9 @@ async function resetSession(params: {
 }
 
 /** Turns the next ordinary session would seed into model context. */
-function nextSessionSeed() {
-  closeOpenClawStateDatabase();
-  return readTranscriptTail(30, { afterLastReset: true });
+async function nextSessionSeed() {
+  await closeOpenClawStateDatabaseAsync();
+  return readTranscriptTailAsync(30, { afterLastReset: true });
 }
 
 /**
@@ -119,12 +126,12 @@ function nextSessionSeed() {
  * directory's lifetime or its removal fails on platforms that lock open files.
  */
 async function withTranscriptState(prefix: string, run: () => Promise<void>): Promise<void> {
-  await withTempDir({ prefix }, async (stateDir) => {
+  await withTestDir({ prefix }, async (stateDir) => {
     process.env.OPENCLAW_STATE_DIR = stateDir;
     try {
       await run();
     } finally {
-      closeOpenClawStateDatabase();
+      await closeOpenClawStateDatabaseAsync();
     }
   });
 }
@@ -137,7 +144,7 @@ describe("openclaw.chat reset boundary", () => {
     [
       "inference verification fails",
       () => {
-        setupInferenceMocks.verifySetupInference.mockResolvedValueOnce({
+        inferenceFallbackMocks.verifySystemAgentInferenceWithFallback.mockResolvedValueOnce({
           ok: false,
           status: "unavailable",
           error: "no configured model",
@@ -155,9 +162,9 @@ describe("openclaw.chat reset boundary", () => {
   ])("keeps the boundary when %s", async (_label, arrangeFailure) => {
     await withTranscriptState("openclaw-reset-boundary-", async () => {
       for (const turn of PRE_RESET_TURNS) {
-        appendTranscriptTurn(turn);
+        await createSystemAgentTranscriptStore().appendTurn(turn);
       }
-      expect(nextSessionSeed()).toEqual(PRE_RESET_TURNS);
+      expect(await nextSessionSeed()).toEqual(PRE_RESET_TURNS);
       const dispose = vi.fn(async () => undefined);
       const sessions = discardableSessions(dispose);
       arrangeFailure();
@@ -169,7 +176,7 @@ describe("openclaw.chat reset boundary", () => {
       // The live session is gone either way, so the boundary must be durable.
       expect(dispose).toHaveBeenCalled();
       expect(sessions.has("s1")).toBe(false);
-      expect(nextSessionSeed()).toEqual([]);
+      expect(await nextSessionSeed()).toEqual([]);
     });
   });
 
@@ -178,9 +185,9 @@ describe("openclaw.chat reset boundary", () => {
   it("keeps the boundary when the reset had no live session", async () => {
     await withTranscriptState("openclaw-reset-boundary-empty-", async () => {
       for (const turn of PRE_RESET_TURNS) {
-        appendTranscriptTurn(turn);
+        await createSystemAgentTranscriptStore().appendTurn(turn);
       }
-      setupInferenceMocks.verifySetupInference.mockResolvedValueOnce({
+      inferenceFallbackMocks.verifySystemAgentInferenceWithFallback.mockResolvedValueOnce({
         ok: false,
         status: "unavailable",
         error: "no configured model",
@@ -191,7 +198,7 @@ describe("openclaw.chat reset boundary", () => {
       await resetSession({ sessions, onRespond: (ok) => responses.push(ok) });
 
       expect(responses[0]).toBe(false);
-      expect(nextSessionSeed()).toEqual([]);
+      expect(await nextSessionSeed()).toEqual([]);
     });
   });
 
@@ -200,7 +207,7 @@ describe("openclaw.chat reset boundary", () => {
   it("keeps the boundary when expiring the pending approval throws", async () => {
     await withTranscriptState("openclaw-reset-boundary-approval-", async () => {
       for (const turn of PRE_RESET_TURNS) {
-        appendTranscriptTurn(turn);
+        await createSystemAgentTranscriptStore().appendTurn(turn);
       }
       const sessions = discardableSessions(async () => undefined);
       const session = expectDefined(sessions.get("s1"), "seeded session test invariant");
@@ -215,14 +222,14 @@ describe("openclaw.chat reset boundary", () => {
 
       expect(expire).toHaveBeenCalledWith("approval-1", "session-reset");
       expect(sessions.has("s1")).toBe(false);
-      expect(nextSessionSeed()).toEqual([]);
+      expect(await nextSessionSeed()).toEqual([]);
     });
   });
 
   it("keeps the boundary when disposing the discarded engine rejects", async () => {
     await withTranscriptState("openclaw-reset-boundary-dispose-", async () => {
       for (const turn of PRE_RESET_TURNS) {
-        appendTranscriptTurn(turn);
+        await createSystemAgentTranscriptStore().appendTurn(turn);
       }
       const sessions = discardableSessions(async () => {
         throw new Error("dispose failed");
@@ -231,7 +238,7 @@ describe("openclaw.chat reset boundary", () => {
       await expect(resetSession({ sessions })).rejects.toThrow("dispose failed");
 
       expect(sessions.has("s1")).toBe(false);
-      expect(nextSessionSeed()).toEqual([]);
+      expect(await nextSessionSeed()).toEqual([]);
     });
   });
 });

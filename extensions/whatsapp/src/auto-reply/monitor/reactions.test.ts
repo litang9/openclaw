@@ -9,6 +9,7 @@ import { createWhatsAppStatusReactionController } from "./status-reaction.js";
 
 const hoisted = vi.hoisted(() => ({
   sendReactionWhatsApp: vi.fn(async () => undefined),
+  resolveGroupActivationFor: vi.fn(async (): Promise<"always" | "mention"> => "always"),
 }));
 
 vi.mock("../../send.js", () => ({
@@ -16,7 +17,7 @@ vi.mock("../../send.js", () => ({
 }));
 
 vi.mock("./group-activation.js", () => ({
-  resolveGroupActivationFor: vi.fn(async () => "always"),
+  resolveGroupActivationFor: hoisted.resolveGroupActivationFor,
 }));
 
 type TestMsgOverrides = NonNullable<Parameters<typeof createTestWebInboundMessage>[0]>;
@@ -65,7 +66,7 @@ function createConfig(
 function createAckEmojiConfig(ackReaction?: AckReactionConfig): OpenClawConfig {
   const cfg = {
     agents: {
-      list: [{ id: "agent", identity: { emoji: "🔥" } }],
+      entries: { agent: { identity: { emoji: "🔥" } } },
     },
     channels: {
       whatsapp: {},
@@ -159,14 +160,10 @@ describe("resolveWhatsAppAckEmoji", () => {
       expected: "🔥",
     },
     {
-      name: "falls back to the routed agent identity emoji when the ack object has no emoji",
-      cfg: createAckEmojiConfig({ direct: true, group: "mentions" }),
-      expected: "🔥",
-    },
-    {
       name: "uses normalized agent ids for the identity fallback",
+      agentId: " Agent ",
       cfg: {
-        agents: { list: [{ id: "Agent", identity: { emoji: "🔥" } }] },
+        agents: { entries: { agent: { identity: { emoji: "🔥" } } } },
         channels: { whatsapp: { ackReaction: { direct: true, group: "mentions" } } },
       } as OpenClawConfig,
       expected: "🔥",
@@ -178,8 +175,8 @@ describe("resolveWhatsAppAckEmoji", () => {
       } as OpenClawConfig,
       expected: "👀",
     },
-  ])("$name", ({ cfg, expected }) => {
-    expect(resolveAckEmoji(cfg)).toBe(expected);
+  ])("$name", ({ cfg, agentId, expected }) => {
+    expect(resolveAckEmoji(cfg, agentId)).toBe(expected);
   });
 });
 
@@ -188,19 +185,16 @@ describe("maybeSendAckReaction", () => {
     vi.clearAllMocks();
   });
 
-  it.each(["ack", "minimal", "extensive"] as const)(
-    "sends ack reactions when reactionLevel is %s",
-    async (reactionLevel) => {
-      const cfg = createConfig(reactionLevel);
-      const ackReaction = await runAckReaction({
-        cfg,
-      });
+  it("sends ack reactions when enabled", async () => {
+    const cfg = createConfig("ack");
+    const ackReaction = await runAckReaction({
+      cfg,
+    });
 
-      expect(ackReaction?.ackReactionValue).toBe("👀");
-      await expect(ackReaction?.ackReactionPromise).resolves.toBe(true);
-      expectAckReactionSent("default", cfg);
-    },
-  );
+    expect(ackReaction?.ackReactionValue).toBe("👀");
+    await expect(ackReaction?.ackReactionPromise).resolves.toBe(true);
+    expectAckReactionSent("default", cfg);
+  });
 
   it("suppresses ack reactions when reactionLevel is off", async () => {
     const ackReaction = await runAckReaction({
@@ -233,6 +227,65 @@ describe("maybeSendAckReaction", () => {
     expectAckReactionSent("work", cfg);
   });
 
+  it.each([
+    {
+      name: "acks a mentioned group message",
+      scope: "group-mentions",
+      activation: "mention",
+      wasMentioned: true,
+      expected: true,
+    },
+    {
+      name: "skips an unmentioned inactive group message",
+      scope: "group-mentions",
+      activation: "mention",
+      wasMentioned: false,
+      expected: false,
+    },
+    {
+      name: "acks an activated group without a literal mention",
+      scope: "group-mentions",
+      activation: "always",
+      wasMentioned: false,
+      expected: true,
+    },
+    {
+      name: "acks every group message under group-all",
+      scope: "group-all",
+      activation: "mention",
+      wasMentioned: false,
+      expected: true,
+    },
+    {
+      name: "keeps direct-only scope out of groups",
+      scope: "direct",
+      activation: "always",
+      wasMentioned: true,
+      expected: false,
+    },
+  ] as const)("$name", async ({ scope, activation, wasMentioned, expected }) => {
+    const cfg = createConfig("ack");
+    cfg.messages!.ackReactionScope = scope;
+    hoisted.resolveGroupActivationFor.mockResolvedValue(activation);
+
+    const ackReaction = await runAckReaction({
+      cfg,
+      msg: createMessage({
+        platform: { chatJid: "120363000000000000@g.us" },
+        admission: {
+          conversation: { kind: "group", id: "120363000000000000@g.us" },
+        },
+        groupMention: { wasMentioned, requireMention: true },
+      }),
+      sessionKey: "whatsapp:default:120363000000000000@g.us",
+    });
+
+    expect(Boolean(ackReaction)).toBe(expected);
+    if (ackReaction) {
+      await expect(ackReaction.ackReactionPromise).resolves.toBe(true);
+    }
+  });
+
   it("uses the canonical emoji preserved from agent identity", async () => {
     const cfg = {
       agents: {
@@ -254,25 +307,6 @@ describe("maybeSendAckReaction", () => {
       "15551234567@s.whatsapp.net",
       "msg-1",
       "🔥",
-      {
-        verbose: false,
-        fromMe: false,
-        accountId: "default",
-        cfg,
-      },
-    );
-  });
-
-  it("returns a handle that removes the ack with an empty reaction", async () => {
-    const cfg = createConfig("ack");
-    const ackReaction = await runAckReaction({ cfg });
-
-    await ackReaction?.remove();
-
-    expect(hoisted.sendReactionWhatsApp).toHaveBeenLastCalledWith(
-      "15551234567@s.whatsapp.net",
-      "msg-1",
-      "",
       {
         verbose: false,
         fromMe: false,

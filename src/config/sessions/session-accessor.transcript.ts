@@ -1,84 +1,64 @@
-import { emitSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
-import {
-  appendSqliteTranscriptEvent as appendTranscriptEvent,
-  appendSqliteTranscriptEventSync as appendTranscriptEventSync,
-  appendSqliteTranscriptMessage as appendTranscriptMessage,
-  appendSqliteTranscriptMessageSync as appendTranscriptMessageSync,
-  findSqliteTranscriptEvent,
-  loadLatestSqliteAssistantText as readLatestTranscriptAssistantText,
-  loadSqliteTranscriptEventRowsAfterSeqSync as loadTranscriptEventRowsAfterSeqSync,
-  loadSqliteTranscriptEvents as loadTranscriptEvents,
-  loadSqliteTranscriptEventsSync as loadTranscriptEventsSync,
-  loadSqliteTranscriptHeaderSync as loadTranscriptHeaderSync,
-  loadSqliteTranscriptTailEventsSync as loadTranscriptTailEventsSync,
-  readSqliteTranscriptStatsSync as readTranscriptStatsSync,
-  readSqliteTranscriptEventAtSeqSync as readTranscriptEventAtSeqSync,
-  readSqliteTranscriptRawDelta as readTranscriptRawDelta,
-  publishSqliteTranscriptUpdate as publishTranscriptUpdate,
-  replaceSqliteTranscriptEvents as replaceTranscriptEvents,
-  replaceSqliteTranscriptEventsSync as replaceTranscriptEventsSync,
-  rewriteSqliteTranscriptEventRowsExact as rewriteTranscriptEventRowsExact,
-  resolveSqliteSessionKeyBySessionId as resolveTranscriptSessionKeyBySessionId,
-  trimSqliteTranscriptForManualCompact,
-  withSqliteTranscriptWriteLock as withTranscriptWriteLock,
-  withSqliteTranscriptWriteTransaction as withTranscriptWriteTransaction,
-} from "./session-accessor.sqlite.js";
+import { safeParseJsonRecord } from "@openclaw/normalization-core";
+import { trimTranscriptForManualCompact } from "./session-accessor.sqlite-transcript-write.js";
 import type {
   SessionTranscriptRuntimeScope,
-  SessionTranscriptReadScope,
-  TranscriptEvent,
   SessionTranscriptManualTrimResult,
   SessionTranscriptManualTrimPreflightResult,
 } from "./session-accessor.types.js";
+import { readTranscriptStatsAsync } from "./session-transcript-stats.js";
 import {
   scanSessionTranscriptTree,
   selectSessionTranscriptTreePathNodes,
 } from "./transcript-tree.js";
-
-// Persisted transcripts have one SQLite owner. Preserve public operation names
-// as direct exports so append, idempotency, locks, and events cannot drift.
+export { persistCompactionBoundaryWithSessionEntrySync } from "./session-accessor.sqlite-compaction.js";
+export { persistCompactionBoundaryWithSessionEntryAsync } from "./session-accessor.sqlite-compaction-runtime.js";
+export { readTranscriptRawDelta } from "./session-accessor.sqlite-delta.js";
+export { resolveSessionKeyBySessionId as resolveTranscriptSessionKeyBySessionId } from "./session-accessor.sqlite-entry.js";
+export { publishTranscriptUpdate } from "./session-accessor.sqlite-events.js";
+export {
+  hasSessionTranscriptEventsSync,
+  readTranscriptMutationAtSync,
+  readTranscriptMutationStateSync,
+} from "./session-accessor.sqlite-metadata-read.js";
+export {
+  inspectTranscriptEventsSync,
+  loadLatestAssistantText as readLatestTranscriptAssistantText,
+  loadTranscriptEventRowsAfterSeqSync,
+  loadTranscriptEventsSync,
+  loadTranscriptHeaderSync,
+  readTranscriptExportSnapshotReadOnlySync,
+  readTranscriptStatsBatchReadOnlySync,
+  readTranscriptStatsSync,
+  validatePreparedAssistantAppendSync,
+  readTranscriptEventAtSeqSync,
+  readTranscriptIdentityByEventId,
+} from "./session-accessor.sqlite-read.js";
+export { hasSessionTranscriptMessage } from "./session-transcript-message-presence.js";
+export { loadTranscriptEvents } from "./session-transcript-events.js";
+export {
+  loadTranscriptSuffixEventsBoundedSync,
+  readPreviousIndexedTranscriptEventSync,
+} from "./session-accessor.sqlite-suffix-read.js";
+export {
+  rewriteAssistantTranscriptMessageForRun,
+  rewriteTranscriptMessageAtAnchor,
+} from "./session-accessor.sqlite-transcript-message-rewrite.js";
+export { readSessionTranscriptMessageByEventId } from "./session-accessor.sqlite-transcript-store.js";
 export {
   appendTranscriptEvent,
   appendTranscriptEventSync,
   appendTranscriptMessage,
   appendTranscriptMessageSync,
-  loadTranscriptEventRowsAfterSeqSync,
-  loadTranscriptEvents,
-  loadTranscriptEventsSync,
-  loadTranscriptHeaderSync,
-  loadTranscriptTailEventsSync,
-  publishTranscriptUpdate,
-  readLatestTranscriptAssistantText,
-  readTranscriptEventAtSeqSync,
-  readTranscriptRawDelta,
-  readTranscriptStatsSync,
   replaceTranscriptEvents,
   replaceTranscriptEventsSync,
+  replaceSessionWithBranchedTranscript,
+  replaceTranscriptSuffixEventsSync,
   rewriteTranscriptEventRowsExact,
-  resolveTranscriptSessionKeyBySessionId,
   withTranscriptWriteLock,
   withTranscriptWriteTransaction,
-};
+} from "./session-accessor.sqlite-transcript-write.js";
 
-/** Keeps transcript event delivery behind the transcript owner boundary. */
-export function emitTranscriptUpdate(
-  update: Parameters<typeof emitSessionTranscriptUpdate>[0],
-): void {
-  emitSessionTranscriptUpdate(update);
-}
-
-/**
- * Finds the newest transcript record accepted by the matcher. Reads rows
- * newest-first with early exit so hot append-path lookups never parse the
- * whole transcript; missing transcripts match nothing. The match is wrapped
- * so parsed falsy records stay distinguishable from "no match".
- */
-export async function findTranscriptEvent(
-  scope: SessionTranscriptReadScope,
-  match: (event: TranscriptEvent) => boolean,
-): Promise<{ event: TranscriptEvent } | undefined> {
-  return findSqliteTranscriptEvent(scope, match);
-}
+export { emitSessionTranscriptUpdate as emitTranscriptUpdate } from "../../sessions/transcript-events.js";
 
 /**
  * Trims a transcript for manual sessions.compact and clears stale token metadata.
@@ -89,13 +69,13 @@ export async function preflightSessionTranscriptForManualCompact(
   scope: SessionTranscriptRuntimeScope,
   params: { maxLines: number; sessionFile?: string },
 ): Promise<SessionTranscriptManualTrimPreflightResult> {
-  const events = await loadTranscriptEvents(scope).catch(() => []);
-  if (events.length === 0) {
+  const { eventCount } = await readTranscriptStatsAsync(scope);
+  if (eventCount === 0) {
     return { compacted: false, reason: "no transcript" };
   }
 
   const maxLines = Math.max(1, Math.floor(params.maxLines));
-  return events.length > maxLines ? { compacted: true } : { compacted: false, kept: events.length };
+  return eventCount > maxLines ? { compacted: true } : { compacted: false, kept: eventCount };
 }
 
 export async function trimSessionTranscriptForManualCompact(
@@ -105,7 +85,7 @@ export async function trimSessionTranscriptForManualCompact(
   const maxLines = Math.max(1, Math.floor(params.maxLines));
   const maxTailLines = Math.max(0, maxLines - 1);
   let declined: SessionTranscriptManualTrimResult = { compacted: false, reason: "no transcript" };
-  const trimmed = await trimSqliteTranscriptForManualCompact(
+  const trimmed = await trimTranscriptForManualCompact(
     scope,
     (lines) => {
       if (lines.length === 0) {
@@ -133,18 +113,7 @@ export async function trimSessionTranscriptForManualCompact(
     return declined;
   }
 
-  return { archived: trimmed.archivedPath, compacted: true, kept: trimmed.kept };
-}
-
-function parseManualCompactTranscriptRecord(line: string): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(line) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
+  return { compacted: true, kept: trimmed.kept };
 }
 
 function normalizeManualCompactTranscriptLines(
@@ -154,14 +123,14 @@ function normalizeManualCompactTranscriptLines(
   if (!headerLine) {
     return null;
   }
-  const header = parseManualCompactTranscriptRecord(headerLine);
+  const header = safeParseJsonRecord(headerLine);
   if (header?.type !== "session" || typeof header.id !== "string") {
     return null;
   }
 
   const records = tailLines
-    .map(parseManualCompactTranscriptRecord)
-    .filter((record): record is Record<string, unknown> => record !== null);
+    .map(safeParseJsonRecord)
+    .filter((record): record is Record<string, unknown> => record !== undefined);
   const retainedIds = new Set<string>();
   const transparentParents = new Map<string, string | null>();
   const normalizedRecords: Record<string, unknown>[] = [];
@@ -223,3 +192,5 @@ function normalizeManualCompactTranscriptLines(
   }
   return [JSON.stringify(header), ...normalizedRecords.map((record) => JSON.stringify(record))];
 }
+
+export { findTranscriptEvent } from "./session-transcript-match.js";

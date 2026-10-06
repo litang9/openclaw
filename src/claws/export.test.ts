@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import { MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES } from "../agents/workspace-bootstrap-read.js";
 import type { McpServerConfig } from "../config/types.mcp.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { PLUGIN_ARTIFACT_ADAPTER_IDENTITY } from "../plugins/install-artifact-inspection.js";
@@ -12,20 +11,54 @@ import { applyClawAddPlan } from "./add.js";
 import { exportClawAgent } from "./export.js";
 import { buildClawAddPlan } from "./lifecycle.js";
 import { installClawMcpServers } from "./mcp.js";
-import { persistClawPackageRef, updateClawInstallRecordStatus } from "./provenance.js";
+import {
+  persistClawPackageRef,
+  updateClawInstallRecord,
+  updateClawInstallRecordStatus,
+} from "./provenance.js";
 import { readClawManifestFile } from "./reader.js";
 import { parseClawManifest } from "./schema.js";
 import type { ClawOpenClawProfile, ClawSourceIdentity } from "./types.js";
+
+const lifecycleStateTestControl = vi.hoisted(() => ({
+  afterRead: undefined as (() => Promise<void>) | undefined,
+}));
+const sourceLimitsTestControl = vi.hoisted(() => ({
+  clawManifestBytes: 8 * 1024,
+  managedWorkspaceBytes: 32 * 1024,
+}));
+
+vi.mock("./lifecycle-state.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./lifecycle-state.js")>();
+  return {
+    ...actual,
+    readClawStatus: async (...args: Parameters<typeof actual.readClawStatus>) => {
+      const status = await actual.readClawStatus(...args);
+      await lifecycleStateTestControl.afterRead?.();
+      return status;
+    },
+  };
+});
+vi.mock("./source-limits.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./source-limits.js")>();
+  return {
+    ...actual,
+    MAX_CLAW_MANIFEST_BYTES: sourceLimitsTestControl.clawManifestBytes,
+    MAX_MANAGED_WORKSPACE_BYTES: sourceLimitsTestControl.managedWorkspaceBytes,
+  };
+});
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 afterEach(() => {
   closeOpenClawStateDatabaseForTest();
+  lifecycleStateTestControl.afterRead = undefined;
   vi.unstubAllEnvs();
 });
 
 async function installedFixture(
   options: {
+    agentProfile?: Pick<ClawOpenClawProfile["agent"], "model" | "subagents">;
     avatar?: string;
     extraWorkspaceFileContent?: Buffer;
     extraWorkspaceFiles?: string[];
@@ -85,8 +118,9 @@ async function installedFixture(
   const openClawProfile: ClawOpenClawProfile = {
     schemaVersion: 1,
     agent: {
+      ...options.agentProfile,
       tools: {
-        profile: "coding",
+        profile: "minimal",
         alsoAllow: ["cron"],
         deny: ["exec"],
         fs: { workspaceOnly: true },
@@ -124,7 +158,7 @@ async function installedFixture(
       ? {
           packageBootstrap: {
             sourcePath: "BOOTSTRAP.md",
-            realPath: packageBootstrapPath,
+            realPath: await realpath(packageBootstrapPath),
             byteLength: packageBootstrapContent.byteLength,
             digest: `sha256:${createHash("sha256").update(packageBootstrapContent).digest("hex")}`,
           },
@@ -134,7 +168,7 @@ async function installedFixture(
     context: { workspace: join(root, "workspace-worker") },
   });
   let config: OpenClawConfig = {};
-  await applyClawAddPlan(plan, {
+  const added = await applyClawAddPlan(plan, {
     consentPlanIntegrity: plan.planIntegrity,
     env: { OPENCLAW_STATE_DIR: join(root, "state") },
     commitConfig: async (transform) => {
@@ -151,6 +185,11 @@ async function installedFixture(
       }),
     cronGateway: { add: async () => ({ id: "scheduler-daily" }) },
   });
+  if (added.status !== "complete") {
+    throw new Error(
+      `installedFixture applyClawAddPlan incomplete (${added.error?.code ?? "unknown_error"}): ${added.error?.message ?? "missing error details"}`,
+    );
+  }
   if (options.withPackage) {
     persistClawPackageRef(
       plan,
@@ -185,13 +224,84 @@ async function installedFixture(
         },
       }),
     },
-    sourceMcpServers: structuredClone(config.mcp?.servers ?? {}),
+    exportOptions: {
+      env: { OPENCLAW_STATE_DIR: join(root, "state") },
+      config,
+      sourceMcpServers: structuredClone(config.mcp?.servers ?? {}),
+    },
   };
 }
 
 describe("exportClawAgent", () => {
+  it("freezes a legacy named profile before exporting it", async () => {
+    const fixture = await installedFixture();
+    fixture.config.agents!.entries!.worker!.tools = {
+      profile: "minimal",
+      deny: ["exec"],
+    };
+    updateClawInstallRecord(
+      {
+        ...fixture.plan,
+        agent: {
+          ...fixture.plan.agent,
+          config: {
+            id: "worker",
+            ...fixture.config.agents!.entries!.worker!,
+            workspace: fixture.plan.agent.workspace,
+          },
+        },
+      },
+      { env: fixture.env },
+    );
+
+    const result = await exportClawAgent("worker", join(fixture.root, "legacy-profile-export"), {
+      ...fixture.exportOptions,
+      packageDeps: fixture.packageDeps,
+    });
+
+    expect(result.openClawProfile?.agent.tools).toMatchObject({
+      profile: "full",
+      allow: expect.arrayContaining(["session_status"]),
+      deny: ["exec"],
+    });
+    expect(result.openClawProfile?.agent.tools).not.toHaveProperty("alsoAllow");
+  });
+
+  it("rejects export of an unbounded legacy full profile", async () => {
+    const fixture = await installedFixture();
+    fixture.config.agents!.entries!.worker!.tools = { profile: "full" };
+    updateClawInstallRecord(
+      {
+        ...fixture.plan,
+        agent: {
+          ...fixture.plan.agent,
+          config: {
+            id: "worker",
+            ...fixture.config.agents!.entries!.worker!,
+            workspace: fixture.plan.agent.workspace,
+          },
+        },
+      },
+      { env: fixture.env },
+    );
+
+    await expect(
+      exportClawAgent("worker", join(fixture.root, "unbounded-profile-export"), {
+        ...fixture.exportOptions,
+        packageDeps: fixture.packageDeps,
+      }),
+    ).rejects.toMatchObject({
+      code: "tool_profile_consent_required",
+    });
+  });
+
   it("writes a grouped package from one installed agent", async () => {
-    const fixture = await installedFixture({ withPackage: true });
+    const agentProfile: ClawOpenClawProfile["agent"] = {
+      model: { primary: "acme/primary", fallbacks: ["acme/fallback"] },
+      subagents: { allowAgents: ["researcher", "reviewer"], delegationMode: "prefer" },
+    };
+    const fixture = await installedFixture({ withPackage: true, agentProfile });
+    expect(fixture.config.agents?.entries?.worker).toMatchObject(agentProfile);
     expect(fixture.plan.agent.config.memory?.search).toEqual({
       enabled: true,
       rememberAcrossConversations: true,
@@ -209,10 +319,8 @@ describe("exportClawAgent", () => {
     const out = join(fixture.root, "exported");
 
     const result = await exportClawAgent("worker", out, {
-      env: fixture.env,
-      config: fixture.config,
+      ...fixture.exportOptions,
       packageDeps: fixture.packageDeps,
-      sourceMcpServers: fixture.sourceMcpServers,
     });
 
     expect(result).toMatchObject({
@@ -258,11 +366,9 @@ describe("exportClawAgent", () => {
       openClawProfile: {
         schemaVersion: 1,
         agent: {
+          ...agentProfile,
           tools: {
-            profile: "coding",
-            alsoAllow: ["cron"],
-            deny: ["exec"],
-            fs: { workspaceOnly: true },
+            ...fixture.plan.agent.config.tools,
           },
           memory: {
             search: {
@@ -292,14 +398,53 @@ describe("exportClawAgent", () => {
     expect(exported.manifest.metadata).toEqual({});
     expect(exported.openClawProfile).toMatchObject({
       schemaVersion: 1,
-      agent: { tools: { profile: "coding" } },
+      agent: { ...agentProfile, tools: fixture.plan.agent.config.tools },
     });
+    expect(exported.openClawProfile?.agent.tools).not.toHaveProperty("alsoAllow");
     expect(exported.manifest.workspace.bootstrapFiles).not.toHaveProperty("SOUL.md");
     await expect(readFile(join(out, "profiles", "openclaw.yml"), "utf8")).resolves.toContain(
-      "profile: coding",
+      "profile: full",
     );
     await expect(readFile(join(out, "workspace", "SOUL.md"), "utf8")).rejects.toThrow();
+    const replanned = await buildClawAddPlan({
+      ...exported,
+      context: {
+        workspace: join(fixture.root, "reimported"),
+        packagePreflight: async () => ({
+          ok: true,
+          action: "install",
+          integrity: `sha256:${"a".repeat(64)}`,
+        }),
+      },
+    });
+    expect(replanned.blockers).toEqual([]);
+    expect(replanned.agent.config).toMatchObject(agentProfile);
   });
+
+  it.each([
+    {},
+    {
+      model: { primary: "acme/primary", fallbacks: [] },
+      subagents: { allowAgents: [], delegationMode: "suggest" as const },
+    },
+  ])(
+    "preserves explicit empty selections without exporting inherited defaults: %j",
+    async (agentProfile) => {
+      const fixture = await installedFixture({ agentProfile });
+      fixture.config.agents!.defaults = {
+        model: { primary: "acme/inherited", fallbacks: ["acme/inherited-fallback"] },
+        subagents: { allowAgents: ["inherited-worker"], delegationMode: "prefer" },
+      };
+      const out = join(fixture.root, "selections");
+      await exportClawAgent("worker", out, fixture.exportOptions);
+      const exported = await readClawManifestFile(out);
+      if (!exported.ok) {
+        throw new Error(JSON.stringify(exported.diagnostics));
+      }
+      expect(exported.openClawProfile?.agent.model).toEqual(agentProfile.model);
+      expect(exported.openClawProfile?.agent.subagents).toEqual(agentProfile.subagents);
+    },
+  );
 
   it("exports extension plugins into profile v1 without duplicating manifest packages", async () => {
     const fixture = await installedFixture();
@@ -326,9 +471,7 @@ describe("exportClawAgent", () => {
     );
 
     const result = await exportClawAgent("worker", join(fixture.root, "exported-extension"), {
-      env: fixture.env,
-      config: fixture.config,
-      sourceMcpServers: fixture.sourceMcpServers,
+      ...fixture.exportOptions,
       packageDeps: {
         resolvePlugin: async () => ({
           status: "found" as const,
@@ -358,6 +501,74 @@ describe("exportClawAgent", () => {
     });
   });
 
+  it("attaches an explicit reviewed package bootstrap and re-reads the export", async () => {
+    const fixture = await installedFixture();
+    const bootstrapPath = join(fixture.root, "reviewed-bootstrap.md");
+    const out = join(fixture.root, "exported-with-bootstrap");
+    await writeFile(bootstrapPath, "# First run\n\nAsk for the operator's timezone.\n", "utf8");
+
+    const result = await exportClawAgent("worker", out, {
+      ...fixture.exportOptions,
+      bootstrapPath,
+    });
+
+    expect(result.filesWritten).toContain("BOOTSTRAP.md");
+    await expect(readFile(join(out, "BOOTSTRAP.md"), "utf8")).resolves.toBe(
+      "# First run\n\nAsk for the operator's timezone.\n",
+    );
+    const exported = await readClawManifestFile(out);
+    expect(exported.ok).toBe(true);
+    if (!exported.ok) {
+      throw new Error(JSON.stringify(exported.diagnostics));
+    }
+    expect(exported.packageBootstrap).toMatchObject({
+      sourcePath: "BOOTSTRAP.md",
+      byteLength: 46,
+    });
+
+    const originalPackage = JSON.parse(await readFile(join(out, "package.json"), "utf8")) as {
+      version: string;
+    };
+    await writeFile(bootstrapPath, "# First run\n\nAsk for the operator's locale.\n", "utf8");
+    const changedOut = join(fixture.root, "exported-with-changed-bootstrap");
+    await exportClawAgent("worker", changedOut, {
+      ...fixture.exportOptions,
+      bootstrapPath,
+    });
+    const changedPackage = JSON.parse(await readFile(join(changedOut, "package.json"), "utf8")) as {
+      version: string;
+    };
+    expect(changedPackage.version).not.toBe(originalPackage.version);
+  });
+
+  it("rejects empty bootstrap authoring without leaving an export target", async () => {
+    const fixture = await installedFixture();
+    const bootstrapPath = join(fixture.root, "empty-bootstrap.md");
+    const out = join(fixture.root, "exported-empty-bootstrap");
+    await writeFile(bootstrapPath, " \n", "utf8");
+
+    await expect(
+      exportClawAgent("worker", out, {
+        ...fixture.exportOptions,
+        bootstrapPath,
+      }),
+    ).rejects.toMatchObject({ code: "bootstrap_empty" });
+    await expect(readFile(join(out, "CLAW.md"), "utf8")).rejects.toThrow();
+  });
+
+  it("rejects non-UTF-8 bootstrap authoring", async () => {
+    const fixture = await installedFixture();
+    const bootstrapPath = join(fixture.root, "binary-bootstrap.md");
+    await writeFile(bootstrapPath, Buffer.from([0xff]));
+
+    await expect(
+      exportClawAgent("worker", join(fixture.root, "exported-binary-bootstrap"), {
+        ...fixture.exportOptions,
+        bootstrapPath,
+      }),
+    ).rejects.toMatchObject({ code: "bootstrap_invalid" });
+  });
+
   it("rejects modified managed content instead of silently creating a snapshot", async () => {
     const fixture = await installedFixture();
     await writeFile(join(fixture.plan.agent.workspace, "SOUL.md"), "operator revision\n", "utf8");
@@ -365,10 +576,8 @@ describe("exportClawAgent", () => {
 
     await expect(
       exportClawAgent("worker", out, {
-        env: fixture.env,
-        config: fixture.config,
+        ...fixture.exportOptions,
         packageDeps: fixture.packageDeps,
-        sourceMcpServers: fixture.sourceMcpServers,
       }),
     ).rejects.toMatchObject({ code: "workspace_files_drifted" });
   });
@@ -378,10 +587,8 @@ describe("exportClawAgent", () => {
     const out = join(fixture.root, "exported-bootstrap");
 
     const result = await exportClawAgent("worker", out, {
-      env: fixture.env,
-      config: fixture.config,
+      ...fixture.exportOptions,
       packageDeps: fixture.packageDeps,
-      sourceMcpServers: fixture.sourceMcpServers,
     });
 
     expect(result.filesWritten).toContain("BOOTSTRAP.md");
@@ -397,28 +604,21 @@ describe("exportClawAgent", () => {
     });
   });
 
-  it("rejects bootstrap content replaced after ownership inspection", async () => {
-    const fixture = await installedFixture({ packageBootstrap: true, withPackage: true });
-    const out = join(fixture.root, "exported-replaced-bootstrap");
+  it("rejects a pending package bootstrap that changes after status inspection", async () => {
+    const fixture = await installedFixture({ packageBootstrap: true });
+    const bootstrapPath = join(fixture.plan.agent.workspace, "BOOTSTRAP.md");
+    const out = join(fixture.root, "exported-raced-bootstrap");
+    lifecycleStateTestControl.afterRead = async () => {
+      await writeFile(bootstrapPath, "# Changed after inspection\n", "utf8");
+    };
 
     await expect(
       exportClawAgent("worker", out, {
-        env: fixture.env,
-        config: fixture.config,
-        packageDeps: {
-          ...fixture.packageDeps,
-          planSkill: async () => {
-            await writeFile(
-              join(fixture.plan.agent.workspace, "BOOTSTRAP.md"),
-              "# Replaced\n\nUnrecorded instructions.\n",
-            );
-            return await fixture.packageDeps.planSkill();
-          },
-        },
-        sourceMcpServers: fixture.sourceMcpServers,
+        ...fixture.exportOptions,
+        packageDeps: fixture.packageDeps,
       }),
     ).rejects.toMatchObject({ code: "bootstrap_drifted" });
-    await expect(stat(out)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(out)).rejects.toThrow();
   });
 
   it("does not export native bootstrap content without package ownership", async () => {
@@ -430,10 +630,8 @@ describe("exportClawAgent", () => {
     const out = join(fixture.root, "exported-native-bootstrap");
 
     const result = await exportClawAgent("worker", out, {
-      env: fixture.env,
-      config: fixture.config,
+      ...fixture.exportOptions,
       packageDeps: fixture.packageDeps,
-      sourceMcpServers: fixture.sourceMcpServers,
     });
 
     expect(result.filesWritten).not.toContain("BOOTSTRAP.md");
@@ -446,32 +644,90 @@ describe("exportClawAgent", () => {
     expect(exported.packageBootstrap).toBeUndefined();
   });
 
-  it("exports a large pending package bootstrap within the native size limit", async () => {
-    const content = Buffer.from("# First run\n\n" + "x".repeat(1024 * 1024 + 32));
-    expect(content.byteLength).toBeLessThanOrEqual(MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES);
-    const fixture = await installedFixture({
-      packageBootstrap: true,
-      packageBootstrapContent: content,
-    });
-    const out = join(fixture.root, "exported-large-bootstrap");
+  it("refuses to export a locally modified package bootstrap", async () => {
+    const fixture = await installedFixture({ packageBootstrap: true });
+    await writeFile(
+      join(fixture.plan.agent.workspace, "BOOTSTRAP.md"),
+      "# Edited onboarding\n",
+      "utf8",
+    );
+    const out = join(fixture.root, "exported-modified-bootstrap");
+
+    await expect(
+      exportClawAgent("worker", out, {
+        ...fixture.exportOptions,
+        packageDeps: fixture.packageDeps,
+      }),
+    ).rejects.toMatchObject({ code: "bootstrap_drifted" });
+    await expect(stat(out)).rejects.toThrow();
+  });
+
+  it("still exports a consumed package bootstrap without a package BOOTSTRAP.md", async () => {
+    const fixture = await installedFixture({ packageBootstrap: true });
+    await rm(join(fixture.plan.agent.workspace, "BOOTSTRAP.md"));
+    const out = join(fixture.root, "exported-consumed-bootstrap");
 
     const result = await exportClawAgent("worker", out, {
-      env: fixture.env,
-      config: fixture.config,
+      ...fixture.exportOptions,
       packageDeps: fixture.packageDeps,
-      sourceMcpServers: fixture.sourceMcpServers,
+    });
+
+    expect(result.filesWritten).not.toContain("BOOTSTRAP.md");
+  });
+
+  it("exports a drifted package bootstrap when a reviewed replacement is supplied", async () => {
+    const fixture = await installedFixture({ packageBootstrap: true });
+    await writeFile(
+      join(fixture.plan.agent.workspace, "BOOTSTRAP.md"),
+      "# Edited onboarding\n",
+      "utf8",
+    );
+    const bootstrapPath = join(fixture.root, "reviewed-replacement.md");
+    await writeFile(bootstrapPath, "# First run\n\nAsk for the operator's timezone.\n", "utf8");
+    const out = join(fixture.root, "exported-replaced-bootstrap");
+
+    const result = await exportClawAgent("worker", out, {
+      ...fixture.exportOptions,
+      packageDeps: fixture.packageDeps,
+      bootstrapPath,
     });
 
     expect(result.filesWritten).toContain("BOOTSTRAP.md");
-    await expect(readFile(join(out, "BOOTSTRAP.md"))).resolves.toEqual(content);
-    await expect(stat(join(out, "BOOTSTRAP.md"))).resolves.toMatchObject({
-      size: content.byteLength,
+    await expect(readFile(join(out, "BOOTSTRAP.md"), "utf8")).resolves.toContain(
+      "operator's timezone",
+    );
+  });
+
+  it("does not reread a pending package bootstrap when an explicit replacement is supplied", async () => {
+    const fixture = await installedFixture({ packageBootstrap: true });
+    const bootstrapPath = join(fixture.root, "reviewed-race-replacement.md");
+    await writeFile(bootstrapPath, "# First run\n\nUse the reviewed replacement.\n", "utf8");
+    lifecycleStateTestControl.afterRead = async () => {
+      await rm(join(fixture.plan.agent.workspace, "BOOTSTRAP.md"));
+    };
+    const out = join(fixture.root, "exported-race-replacement");
+
+    const result = await exportClawAgent("worker", out, {
+      ...fixture.exportOptions,
+      packageDeps: fixture.packageDeps,
+      bootstrapPath,
     });
+
+    expect(result.filesWritten).toContain("BOOTSTRAP.md");
+    await expect(readFile(join(out, "BOOTSTRAP.md"), "utf8")).resolves.toContain(
+      "reviewed replacement",
+    );
   });
 
   it("keeps pending package bootstrap outside the managed workspace aggregate", async () => {
-    const workspaceContent = Buffer.alloc(900 * 1024, "w");
-    const bootstrapContent = Buffer.alloc(1536 * 1024, "b");
+    const workspaceContent = Buffer.alloc(9 * 1024, "w");
+    const bootstrapContent = Buffer.alloc(6 * 1024, "b");
+    expect(workspaceContent.byteLength * 3).toBeLessThan(
+      sourceLimitsTestControl.managedWorkspaceBytes,
+    );
+    expect(workspaceContent.byteLength * 3 + bootstrapContent.byteLength).toBeGreaterThan(
+      sourceLimitsTestControl.managedWorkspaceBytes,
+    );
     const fixture = await installedFixture({
       extraWorkspaceFiles: ["one.md", "two.md", "three.md"],
       extraWorkspaceFileContent: workspaceContent,
@@ -481,10 +737,8 @@ describe("exportClawAgent", () => {
     const out = join(fixture.root, "exported-independent-bootstrap-quota");
 
     const result = await exportClawAgent("worker", out, {
-      env: fixture.env,
-      config: fixture.config,
+      ...fixture.exportOptions,
       packageDeps: fixture.packageDeps,
-      sourceMcpServers: fixture.sourceMcpServers,
     });
 
     expect(result.filesWritten).toContain("BOOTSTRAP.md");
@@ -499,9 +753,7 @@ describe("exportClawAgent", () => {
     const out = join(fixture.root, "exported-empty-soul");
 
     await exportClawAgent("worker", out, {
-      env: fixture.env,
-      config: fixture.config,
-      sourceMcpServers: fixture.sourceMcpServers,
+      ...fixture.exportOptions,
     });
 
     const exported = await readClawManifestFile(out);
@@ -521,9 +773,7 @@ describe("exportClawAgent", () => {
     const out = join(fixture.root, "exported-binary-soul");
 
     await exportClawAgent("worker", out, {
-      env: fixture.env,
-      config: fixture.config,
-      sourceMcpServers: fixture.sourceMcpServers,
+      ...fixture.exportOptions,
     });
 
     const exported = await readClawManifestFile(out);
@@ -539,13 +789,13 @@ describe("exportClawAgent", () => {
   });
 
   it("keeps SOUL.md as a sidecar when embedding would exceed the CLAW.md limit", async () => {
-    const fixture = await installedFixture({ soulContent: Buffer.alloc(1024 * 1024, 0x61) });
+    const fixture = await installedFixture({
+      soulContent: Buffer.alloc(sourceLimitsTestControl.clawManifestBytes, 0x61),
+    });
     const out = join(fixture.root, "exported-large-soul");
 
     await exportClawAgent("worker", out, {
-      env: fixture.env,
-      config: fixture.config,
-      sourceMcpServers: fixture.sourceMcpServers,
+      ...fixture.exportOptions,
     });
 
     const exported = await readClawManifestFile(out);
@@ -608,9 +858,7 @@ describe("exportClawAgent", () => {
     const out = join(fixture.root, "exported-avatar");
 
     const result = await exportClawAgent("worker", out, {
-      env: fixture.env,
-      config: fixture.config,
-      sourceMcpServers: fixture.sourceMcpServers,
+      ...fixture.exportOptions,
     });
 
     expect(result.manifest.agent.identity?.avatar).toBe("avatars/worker.png");
@@ -644,9 +892,7 @@ describe("exportClawAgent", () => {
     vi.stubEnv("HOME", fixture.root);
 
     const result = await exportClawAgent("worker", "~/exported-home", {
-      env: fixture.env,
-      config: fixture.config,
-      sourceMcpServers: fixture.sourceMcpServers,
+      ...fixture.exportOptions,
     });
 
     expect(result.outputDirectory).toBe(join(fixture.root, "exported-home"));
@@ -662,9 +908,7 @@ describe("exportClawAgent", () => {
 
     await expect(
       exportClawAgent("worker", join(fixture.root, "exported-missing"), {
-        env: fixture.env,
-        config: fixture.config,
-        sourceMcpServers: fixture.sourceMcpServers,
+        ...fixture.exportOptions,
       }),
     ).rejects.toMatchObject({ code: "workspace_files_drifted" });
   });
@@ -677,9 +921,7 @@ describe("exportClawAgent", () => {
 
     await expect(
       exportClawAgent("worker", out, {
-        env: fixture.env,
-        config: fixture.config,
-        sourceMcpServers: fixture.sourceMcpServers,
+        ...fixture.exportOptions,
       }),
     ).rejects.toMatchObject({ code: "output_collision" });
     await expect(readFile(join(out, "operator.txt"), "utf8")).resolves.toBe("keep\n");

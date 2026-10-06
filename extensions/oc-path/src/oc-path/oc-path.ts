@@ -11,6 +11,7 @@
  */
 
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
+import { containsAsciiControlCharacter as hasControlChar } from "openclaw/plugin-sdk/string-normalization-runtime";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { OcEmitSentinelError, REDACTED_SENTINEL } from "./sentinel.js";
 
@@ -22,18 +23,6 @@ const MAX_SUB_SEGMENTS_PER_SLOT = 64;
 export const MAX_TRAVERSAL_DEPTH = 256;
 
 const BOM = "﻿";
-
-// Walk by char code rather than regex — the no-control-regex lint rule
-// rejects character classes covering U+0000–U+001F + U+007F.
-function hasControlChar(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    const cc = s.charCodeAt(i);
-    if (cc <= 0x1f || cc === 0x7f) {
-      return true;
-    }
-  }
-  return false;
-}
 
 const RESERVED_CHARS_RE = /[?&%]/;
 
@@ -188,7 +177,6 @@ export function parseOcPath(input: string): OcPath {
   }
 
   for (const seg of segments) {
-    validateBrackets(seg, input);
     const subs = splitRespectingBrackets(seg, ".", input);
     if (subs.length > MAX_SUB_SEGMENTS_PER_SLOT) {
       fail(
@@ -397,7 +385,7 @@ export function resolvePositionalSeg(seg: string, container: PositionalContainer
 /**
  * Wildcard tokens permitted in `findOcPaths` patterns.
  * `*` matches one sub-segment; `**` matches zero or more (recursive).
- * Reject in resolve/set via `hasWildcard`.
+ * Reject in resolve/set via `isPattern`.
  */
 export const WILDCARD_SINGLE = "*";
 export const WILDCARD_RECURSIVE = "**";
@@ -407,7 +395,7 @@ export const WILDCARD_RECURSIVE = "**";
  * union `{a,b,c}`, or predicate `[k=v]`). Single-match verbs reject
  * these; only `findOcPaths` consumes them.
  */
-function isPattern(path: OcPath): boolean {
+export function isPattern(path: OcPath): boolean {
   for (const slot of [path.section, path.item, path.field]) {
     if (slot === undefined) {
       continue;
@@ -428,9 +416,6 @@ function isPattern(path: OcPath): boolean {
   }
   return false;
 }
-
-/** @deprecated v1 — use {@link isPattern}. Behaviorally identical. */
-export const hasWildcard = isPattern;
 
 /** Union segment `{a,b,c}` matches each comma-separated alternative. */
 export function isUnionSeg(seg: string): boolean {
@@ -642,8 +627,15 @@ export function splitRespectingBrackets(
   return out;
 }
 
+/** Flatten concrete path slots while preserving quoted keys as one segment. */
+export function splitOcPathSlots(...slots: readonly (string | undefined)[]): string[] {
+  return slots.flatMap((slot) =>
+    slot === undefined ? [] : splitRespectingBrackets(slot, ".").map(unquoteSeg),
+  );
+}
+
 /** True iff `seg` is `"..."`. */
-export function isQuotedSeg(seg: string): boolean {
+function isQuotedSeg(seg: string): boolean {
   return seg.length >= 2 && seg.startsWith('"') && seg.endsWith('"');
 }
 
@@ -665,22 +657,6 @@ export function quoteSeg(value: string): string {
     );
   }
   return /[/.[\]{}?&%\s]/.test(value) ? `"${value}"` : value;
-}
-
-// Defense-in-depth — the splitter validates segments it splits; this
-// catches stray unmatched brackets in unsplit ones.
-function validateBrackets(seg: string, input: string): void {
-  scanBracketAware(
-    seg,
-    () => undefined,
-    () => {
-      fail(
-        `Unbalanced bracket/brace in segment "${seg}": ${printable(input)}`,
-        input,
-        "OC_PATH_UNBALANCED",
-      );
-    },
-  );
 }
 
 function validateSubSegment(sub: string, input: string): void {

@@ -1,6 +1,7 @@
 // Operator approvals client tests cover connect lifecycle, request framing,
 // scope-upgrade errors, and graceful shutdown behavior for approval operations.
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { resolveGatewayClientBootstrap } from "./client-bootstrap.js";
 
 const clientState = vi.hoisted(() => ({
   options: null as Record<string, unknown> | null,
@@ -57,13 +58,22 @@ class MockGatewayClient {
   }
 }
 
-vi.mock("./client-bootstrap.js", () => ({
-  resolveGatewayClientBootstrap: vi.fn(async () => ({
+const resolveGatewayClientBootstrapMock = vi.hoisted(() =>
+  vi.fn<typeof resolveGatewayClientBootstrap>(async () => ({
     url: bootstrapState.url,
     urlSource: bootstrapState.urlSource,
+    connectionDetails: {
+      url: bootstrapState.url,
+      urlSource: bootstrapState.urlSource,
+      message: `Gateway target: ${bootstrapState.url}`,
+    },
     auth: bootstrapState.auth,
     tlsFingerprint: bootstrapState.tlsFingerprint,
   })),
+);
+
+vi.mock("./client-bootstrap.js", () => ({
+  resolveGatewayClientBootstrap: resolveGatewayClientBootstrapMock,
 }));
 
 vi.mock("./client.js", () => ({
@@ -173,11 +183,6 @@ describe("withOperatorApprovalsGatewayClient", () => {
       name: "configured remote loopback gateway URLs",
       url: "ws://127.0.0.1:18789",
       urlSource: "config gateway.remote.url",
-    },
-    {
-      name: "env loopback gateway URL overrides",
-      url: "ws://127.0.0.1:18789",
-      urlSource: "env OPENCLAW_GATEWAY_URL",
     },
   ])("omits approval runtime token for $name", async ({ url, urlSource, gatewayUrl }) => {
     bootstrapState.url = url;

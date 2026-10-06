@@ -1,30 +1,30 @@
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { appendTranscriptEvent, upsertSessionEntry } from "../config/sessions/session-accessor.js";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  appendTranscriptEvent,
+  upsertSessionEntryCore,
+} from "../config/sessions/session-accessor.js";
 import {
   resolveSqliteTranscriptReadScope,
   toDatabaseOptions,
 } from "../config/sessions/session-accessor.sqlite-scope.js";
 import { runWithSessionTranscriptReadFence } from "../config/sessions/session-transcript-read-fence.js";
 import { waitForSessionTranscriptIndexReconcile } from "../config/sessions/session-transcript-reconcile.js";
+import { useSessionStoreTempDirs } from "../test-utils/session-state-cleanup.js";
 import {
   appendSessionTranscriptMessageByIdentity,
   readSessionTranscriptVisibleMessageDelta,
 } from "./session-transcript-runtime.js";
+
+const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-sdk-visible-transcript-");
 
 describe("session transcript visible cursor SDK", () => {
   let tempDir: string;
   let storePath: string;
 
   beforeEach(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sdk-visible-transcript-"));
+    tempDir = sessionDirs.make();
     storePath = path.join(tempDir, "sessions.json");
-  });
-
-  afterEach(() => {
-    fs.rmSync(tempDir, { force: true, recursive: true });
   });
 
   it("pages appends and resets when the active branch changes", async () => {
@@ -34,7 +34,7 @@ describe("session transcript visible cursor SDK", () => {
       sessionKey: "agent:main:visible-delta",
       storePath,
     };
-    await upsertSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 10 });
+    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 10 });
     const root = await appendSessionTranscriptMessageByIdentity({
       ...scope,
       message: { role: "user", content: "root" },
@@ -68,6 +68,25 @@ describe("session transcript visible cursor SDK", () => {
     });
     if (first.kind !== "page") {
       throw new Error("expected first visible transcript page");
+    }
+
+    const decodedCursor = JSON.parse(
+      Buffer.from(first.cursor, "base64url").toString("utf8"),
+    ) as Record<string, unknown>;
+    const nonCanonicalCursors = [
+      `${first.cursor}!`,
+      `${first.cursor}=`,
+      Buffer.from(JSON.stringify({ ...decodedCursor, extra: true }), "utf8").toString("base64url"),
+    ];
+    for (const cursor of nonCanonicalCursors) {
+      await expect(
+        readSessionTranscriptVisibleMessageDelta({
+          ...scope,
+          cursor,
+          maxBytes: 10_000,
+          maxMessages: 1,
+        }),
+      ).resolves.toMatchObject({ kind: "reset", reason: "invalid_cursor" });
     }
 
     const second = await readSessionTranscriptVisibleMessageDelta({
@@ -195,7 +214,7 @@ describe("session transcript visible cursor SDK", () => {
       storePath,
     };
     const content = "x".repeat(200);
-    await upsertSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 10 });
+    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 10 });
     await appendSessionTranscriptMessageByIdentity({
       ...scope,
       message: { role: "user", content },
@@ -265,7 +284,7 @@ describe("session transcript visible cursor SDK", () => {
       sessionKey: "agent:main:visible-delta-fence",
       storePath,
     };
-    await upsertSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 10 });
+    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 10 });
     const prior = await appendSessionTranscriptMessageByIdentity({
       ...scope,
       message: { role: "user", content: "same prompt" },

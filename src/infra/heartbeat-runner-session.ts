@@ -1,11 +1,11 @@
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import {
   canonicalizeMainSessionAlias,
   resolveAgentMainSessionKey,
 } from "../config/sessions/main-session.js";
-import { resolveStorePath } from "../config/sessions/paths.js";
-import { loadSessionEntry, patchSessionEntry } from "../config/sessions/session-accessor.js";
+import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
+import { loadSessionEntry, patchSessionEntryCore } from "../config/sessions/session-accessor.js";
+import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   isSubagentSessionKey,
@@ -14,139 +14,121 @@ import {
   toAgentStoreSessionKey,
 } from "../routing/session-key.js";
 import { resolveMainScopedEventSessionKey } from "./event-session-routing.js";
-import type { HeartbeatConfig } from "./heartbeat-runner-config.js";
+import type { HeartbeatConfig } from "./heartbeat-config.js";
 
-export function resolveHeartbeatSession(
+export function resolveHeartbeatSessionKey(
   cfg: OpenClawConfig,
-  agentId?: string,
+  agentId: string,
   heartbeat?: HeartbeatConfig,
   forcedSessionKey?: string,
   env: NodeJS.ProcessEnv = process.env,
 ) {
   const sessionCfg = cfg.session;
   const scope = sessionCfg?.scope ?? "per-sender";
-  const resolvedAgentId = normalizeAgentId(agentId ?? resolveDefaultAgentId(cfg));
+  const resolvedAgentId = normalizeAgentId(agentId);
   const mainSessionKey =
     scope === "global" ? "global" : resolveAgentMainSessionKey({ cfg, agentId: resolvedAgentId });
-  const storePath = resolveStorePath(sessionCfg?.store, {
+  const storePath = resolveSessionStorePathCore(sessionCfg?.store, {
     // A literal `global` row is global only inside the selected agent's store.
     // Falling back here leaks the default agent's route into secondary heartbeats.
     agentId: resolvedAgentId,
     env,
   });
-  const mainEntry = loadSessionEntry({ storePath, sessionKey: mainSessionKey, env });
+  const mainSession = (suppressOriginatingContext = false) => ({
+    sessionKey: mainSessionKey,
+    storePath,
+    suppressOriginatingContext,
+  });
 
   if (scope === "global") {
-    return {
-      sessionKey: mainSessionKey,
-      storePath,
-      entry: mainEntry,
-      suppressOriginatingContext: false,
-    };
+    return mainSession();
   }
+
+  const resolveCandidate = (requestKey: string) => {
+    const candidate = toAgentStoreSessionKey({
+      agentId: resolvedAgentId,
+      requestKey,
+      mainKey: cfg.session?.mainKey,
+    });
+    if (isSubagentSessionKey(candidate)) {
+      return undefined;
+    }
+    const canonical = canonicalizeMainSessionAlias({
+      cfg,
+      agentId: resolvedAgentId,
+      sessionKey: candidate,
+    });
+    return canonical !== "global" &&
+      !isSubagentSessionKey(canonical) &&
+      resolveAgentIdFromSessionKey(canonical) === normalizeAgentId(resolvedAgentId)
+      ? canonical
+      : undefined;
+  };
 
   // Guard: never route heartbeats to subagent sessions, regardless of entry path.
   const forced = forcedSessionKey?.trim();
   if (forced && isSubagentSessionKey(forced)) {
-    return {
-      sessionKey: mainSessionKey,
-      storePath,
-      entry: mainEntry,
-      suppressOriginatingContext: true,
-    };
+    return mainSession(true);
   }
 
-  if (forced && !isSubagentSessionKey(forced)) {
-    const forcedCandidate = toAgentStoreSessionKey({
-      agentId: resolvedAgentId,
-      requestKey: forced,
-      mainKey: cfg.session?.mainKey,
-    });
-    if (!isSubagentSessionKey(forcedCandidate)) {
-      const forcedCanonical = canonicalizeMainSessionAlias({
-        cfg,
-        agentId: resolvedAgentId,
-        sessionKey: forcedCandidate,
-      });
-      if (forcedCanonical !== "global" && !isSubagentSessionKey(forcedCanonical)) {
-        const sessionAgentId = resolveAgentIdFromSessionKey(forcedCanonical);
-        if (sessionAgentId === normalizeAgentId(resolvedAgentId)) {
-          const routedSessionKey =
-            resolveMainScopedEventSessionKey({
-              cfg,
-              sessionKey: forcedCanonical,
-              agentId: resolvedAgentId,
-            }) ?? forcedCanonical;
-          return {
-            sessionKey: routedSessionKey,
-            storePath,
-            entry: loadSessionEntry({ storePath, sessionKey: routedSessionKey, env }),
-            suppressOriginatingContext: false,
-          };
-        }
-      }
-    }
+  const forcedCanonical = forced ? resolveCandidate(forced) : undefined;
+  if (forcedCanonical) {
+    return {
+      sessionKey:
+        resolveMainScopedEventSessionKey({
+          cfg,
+          sessionKey: forcedCanonical,
+          agentId: resolvedAgentId,
+        }) ?? forcedCanonical,
+      storePath,
+      suppressOriginatingContext: false,
+    };
   }
 
   const trimmed = heartbeat?.session?.trim() ?? "";
   if (!trimmed || isSubagentSessionKey(trimmed)) {
-    return {
-      sessionKey: mainSessionKey,
-      storePath,
-      entry: mainEntry,
-      suppressOriginatingContext: false,
-    };
+    return mainSession();
   }
 
   const normalized = normalizeLowercaseStringOrEmpty(trimmed);
   if (normalized === "main" || normalized === "global") {
-    return {
-      sessionKey: mainSessionKey,
-      storePath,
-      entry: mainEntry,
-      suppressOriginatingContext: false,
-    };
+    return mainSession();
   }
 
-  const candidate = toAgentStoreSessionKey({
-    agentId: resolvedAgentId,
-    requestKey: trimmed,
-    mainKey: cfg.session?.mainKey,
-  });
-  if (isSubagentSessionKey(candidate)) {
-    return {
-      sessionKey: mainSessionKey,
-      storePath,
-      entry: mainEntry,
-      suppressOriginatingContext: false,
-    };
-  }
-  const canonical = canonicalizeMainSessionAlias({
-    cfg,
-    agentId: resolvedAgentId,
-    sessionKey: candidate,
-  });
-  if (canonical !== "global" && !isSubagentSessionKey(canonical)) {
-    const sessionAgentId = resolveAgentIdFromSessionKey(canonical);
-    if (sessionAgentId === normalizeAgentId(resolvedAgentId)) {
-      return {
-        sessionKey: canonical,
-        storePath,
-        entry: loadSessionEntry({ storePath, sessionKey: canonical, env }),
-        suppressOriginatingContext: false,
-      };
-    }
-  }
+  const canonical = resolveCandidate(trimmed);
+  return canonical
+    ? { sessionKey: canonical, storePath, suppressOriginatingContext: false }
+    : mainSession();
+}
 
+/** The heartbeat's event queue session and its stored row. */
+export type ResolvedHeartbeatSession = {
+  sessionKey: string;
+  storePath: string;
+  suppressOriginatingContext: boolean;
+  entry: SessionEntry | undefined;
+};
+
+export function resolveHeartbeatSession(
+  cfg: OpenClawConfig,
+  agentId: string,
+  heartbeat?: HeartbeatConfig,
+  forcedSessionKey?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedHeartbeatSession {
+  const resolved = resolveHeartbeatSessionKey(cfg, agentId, heartbeat, forcedSessionKey, env);
   return {
-    sessionKey: mainSessionKey,
-    storePath,
-    entry: mainEntry,
-    suppressOriginatingContext: false,
+    ...resolved,
+    entry: loadSessionEntry({
+      agentId,
+      storePath: resolved.storePath,
+      sessionKey: resolved.sessionKey,
+      env,
+    }),
   };
 }
 
-export function resolveIsolatedHeartbeatSessionKey(params: {
+function resolveIsolatedHeartbeatSessionKey(params: {
   agentId: string;
   sessionKey: string;
   configuredSessionKey: string;
@@ -207,6 +189,60 @@ export function resolveIsolatedHeartbeatSessionKey(params: {
   };
 }
 
+/** Execution key and descriptive conversation chosen for a heartbeat event queue. */
+export type HeartbeatSessionSelection = ResolvedHeartbeatSession & {
+  run:
+    | { kind: "shared"; sessionKey: string }
+    | { kind: "isolated"; sessionKey: string; baseSessionKey: string };
+  conversationEntry: SessionEntry | undefined;
+  inspectsRunQueue: boolean;
+};
+
+/** Selects the execution key and descriptive conversation for an already-resolved event queue. */
+export function resolveHeartbeatSessionSelection(
+  cfg: OpenClawConfig,
+  agentId: string,
+  heartbeat: HeartbeatConfig | undefined,
+  session: ResolvedHeartbeatSession,
+  isolated: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): HeartbeatSessionSelection {
+  if (!isolated) {
+    return {
+      ...session,
+      run: { kind: "shared", sessionKey: session.sessionKey },
+      conversationEntry: session.entry,
+      inspectsRunQueue: true,
+    };
+  }
+  const configured = resolveHeartbeatSessionKey(cfg, agentId, heartbeat, undefined, env);
+  const { isolatedSessionKey, isolatedBaseSessionKey } = resolveIsolatedHeartbeatSessionKey({
+    agentId,
+    sessionKey: session.sessionKey,
+    configuredSessionKey: configured.sessionKey,
+    sessionEntry: session.entry,
+  });
+  return {
+    ...session,
+    run: {
+      kind: "isolated",
+      sessionKey: isolatedSessionKey,
+      baseSessionKey: isolatedBaseSessionKey,
+    },
+    conversationEntry:
+      isolatedBaseSessionKey === session.sessionKey
+        ? session.entry
+        : loadSessionEntry({
+            agentId,
+            storePath: session.storePath,
+            sessionKey: isolatedBaseSessionKey,
+            env,
+          }),
+    // Legacy isolated queues retain their route after the execution key is canonicalized.
+    inspectsRunQueue: session.sessionKey !== isolatedBaseSessionKey,
+  };
+}
+
 export function resolveStaleHeartbeatIsolatedSessionKey(params: {
   sessionKey: string;
   isolatedSessionKey: string;
@@ -227,33 +263,26 @@ export function resolveStaleHeartbeatIsolatedSessionKey(params: {
 }
 
 export async function restoreHeartbeatUpdatedAt(params: {
+  agentId: string;
   storePath: string;
   sessionKey: string;
   updatedAt?: number;
 }) {
-  const { storePath, sessionKey, updatedAt } = params;
+  const { updatedAt, ...scope } = params;
   if (typeof updatedAt !== "number") {
     return;
   }
-  const entry = loadSessionEntry({ storePath, sessionKey });
-  if (!entry) {
+  const entry = loadSessionEntry(scope);
+  if (!entry || entry.updatedAt === Math.max(entry.updatedAt ?? 0, updatedAt)) {
     return;
   }
-  const nextUpdatedAt = Math.max(entry.updatedAt ?? 0, updatedAt);
-  if (entry.updatedAt === nextUpdatedAt) {
-    return;
-  }
-  await patchSessionEntry(
-    { storePath, sessionKey },
+  await patchSessionEntryCore(
+    scope,
     (nextEntry, context) => {
-      if (!context.existingEntry) {
-        return null;
-      }
       const resolvedUpdatedAt = Math.max(nextEntry.updatedAt ?? 0, updatedAt);
-      if (nextEntry.updatedAt === resolvedUpdatedAt) {
-        return null;
-      }
-      return { ...nextEntry, updatedAt: resolvedUpdatedAt };
+      return context.existingEntry && nextEntry.updatedAt !== resolvedUpdatedAt
+        ? { ...nextEntry, updatedAt: resolvedUpdatedAt }
+        : null;
     },
     { replaceEntry: true },
   );

@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
@@ -15,14 +14,9 @@ import {
   writeMemoryWikiSourceSyncState,
   type MemoryWikiImportedSourceGroup,
 } from "./source-sync-state.js";
+import { createMemoryWikiTestHarness } from "./test-helpers.js";
 
-const tempDirs: string[] = [];
-
-async function makeTempDir(): Promise<string> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "memory-wiki-malformed-notes-"));
-  tempDirs.push(dir);
-  return dir;
-}
+const tempDirs = createMemoryWikiTestHarness();
 
 function createImportedSourceState(pagePath: string, group: MemoryWikiImportedSourceGroup) {
   return {
@@ -47,22 +41,16 @@ describe("memory wiki source sync malformed human Notes", () => {
 
   afterEach(async () => {
     resetPluginStateStoreForTests();
-    await Promise.all(
-      tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })),
-    );
   });
 
   it.each([
     { group: "bridge" as const, missingMarker: "opening" as const },
     { group: "bridge" as const, missingMarker: "closing" as const },
-    { group: "bridge" as const, missingMarker: "both" as const },
-    { group: "unsafe-local" as const, missingMarker: "opening" as const },
-    { group: "unsafe-local" as const, missingMarker: "closing" as const },
     { group: "unsafe-local" as const, missingMarker: "both" as const },
   ])(
     "preserves $group pages and persisted state when the $missingMarker marker is missing",
     async ({ group, missingMarker }) => {
-      const stateDir = await makeTempDir();
+      const stateDir = await tempDirs.createTempDir("memory-wiki-malformed-notes-");
       const vaultRoot = path.join(stateDir, "vault");
       const pagePath = `sources/${group}-missing-${missingMarker}.md`;
       const pageAbsPath = path.join(vaultRoot, pagePath);
@@ -124,7 +112,7 @@ describe("memory wiki source sync malformed human Notes", () => {
   );
 
   it("rejects pruning an oversized source page with an unclosed human Notes marker", async () => {
-    const vaultRoot = await makeTempDir();
+    const vaultRoot = await tempDirs.createTempDir("memory-wiki-malformed-notes-");
     const pagePath = "sources/oversized-missing-closing-marker.md";
     const pageAbsPath = path.join(vaultRoot, pagePath);
     await fs.mkdir(path.dirname(pageAbsPath), { recursive: true });

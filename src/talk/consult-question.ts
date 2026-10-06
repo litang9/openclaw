@@ -51,8 +51,6 @@ export type RealtimeVoiceSpeakableToolResultOptions = {
   keys?: readonly string[];
   /** Maximum spoken result length before appending a truncation marker. */
   maxChars?: number;
-  /** Whether a raw string result is allowed as speakable output. */
-  stringResult?: boolean;
 };
 
 /** Read the consult question from a raw string or selected object keys. */
@@ -70,9 +68,7 @@ export function readRealtimeVoiceConsultQuestion(
 }
 
 /** Normalize consult questions for stable matching across punctuation/casing. */
-export function normalizeRealtimeVoiceConsultQuestion(
-  value: string | undefined,
-): string | undefined {
+function normalizeRealtimeVoiceConsultQuestion(value: string | undefined): string | undefined {
   return (
     value
       ?.toLowerCase()
@@ -126,11 +122,8 @@ export function readSpeakableRealtimeVoiceToolResult(
   result: unknown,
   options: RealtimeVoiceSpeakableToolResultOptions = {},
 ): string | undefined {
-  const stringResult = options.stringResult ?? true;
   if (typeof result === "string") {
-    return stringResult
-      ? limitSpeakableRealtimeVoiceToolResult(result, options.maxChars)
-      : undefined;
+    return limitSpeakableRealtimeVoiceToolResult(result, options.maxChars);
   }
   if (!result || typeof result !== "object" || Array.isArray(result)) {
     return undefined;

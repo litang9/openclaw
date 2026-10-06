@@ -1,14 +1,12 @@
 // Whatsapp tests cover inbound context plugin behavior.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createTestWebInboundMessage } from "../../inbound/test-message.test-helper.js";
-import { createEchoTracker } from "./echo.js";
 import { formatGroupMembers, noteGroupMember } from "./group-members.js";
 import {
   resolveVisibleWhatsAppGroupHistory,
   resolveVisibleWhatsAppReplyContext,
 } from "./inbound-context.js";
 import { trackBackgroundTask } from "./last-route.js";
-import { projectPreparedChannelInbound, type PreparedChannelInbound } from "./prepared-inbound.js";
 
 type ReplyContextParams = Parameters<typeof resolveVisibleWhatsAppReplyContext>[0];
 
@@ -130,57 +128,6 @@ describe("whatsapp inbound context visibility", () => {
   });
 });
 
-describe("createEchoTracker", () => {
-  it("keeps verbose previews UTF-16 safe without changing the tracked text", () => {
-    const logVerbose = vi.fn();
-    const tracker = createEchoTracker({ logVerbose });
-    const prefix = "x".repeat(49);
-    const text = `${prefix}😀tail`;
-
-    tracker.rememberText(text, { logVerboseMessage: true });
-
-    expect(logVerbose).toHaveBeenCalledExactlyOnceWith(
-      `Added to echo detection set (size now: 1): ${prefix}...`,
-    );
-    expect(tracker.has(text)).toBe(true);
-  });
-
-  it("keeps identical text isolated to its originating conversation", () => {
-    const tracker = createEchoTracker({});
-
-    tracker.rememberText("Done.", { conversationId: "+1000" });
-
-    expect(tracker.has("Done.", "+1000")).toBe(true);
-    expect(tracker.has("Done.", "+3000")).toBe(false);
-
-    tracker.forget("Done.", "+1000");
-
-    expect(tracker.has("Done.", "+1000")).toBe(false);
-  });
-
-  it("keeps combined-message deduplication independent of conversation-scoped text", () => {
-    const tracker = createEchoTracker({});
-    const combinedKey = tracker.buildCombinedKey({
-      sessionKey: "agent:main:whatsapp:+1000",
-      combinedBody: "first\nsecond",
-    });
-
-    tracker.rememberText("Done.", {
-      conversationId: "+1000",
-      combinedBody: "first\nsecond",
-      combinedBodySessionKey: "agent:main:whatsapp:+1000",
-    });
-
-    expect(tracker.has(combinedKey)).toBe(true);
-    expect(tracker.has("Done.", "+1000")).toBe(true);
-
-    tracker.forget(combinedKey);
-
-    expect(tracker.has(combinedKey)).toBe(false);
-    expect(tracker.has("Done.", "+1000")).toBe(true);
-  });
-});
-
 describe("group member display", () => {
   it("normalizes member phone numbers before storing", () => {
     const groupMemberNames = new Map<string, Map<string, string>>();
@@ -263,64 +210,5 @@ describe("trackBackgroundTask", () => {
 
     expect(backgroundTasks.size).toBe(0);
     expect(unhandledRejections).toStrictEqual([]);
-  });
-});
-
-describe("WhatsApp prepared inbound", () => {
-  it("projects portable facts without WhatsApp transport state", () => {
-    const inbound = {
-      channel: "whatsapp",
-      accountId: "work",
-      event: { id: "event-1", fullId: "whatsapp:event-1", timestamp: 1_710_000_000 },
-      from: "whatsapp:user:u1",
-      sender: { id: "u1", name: "Alice" },
-      conversation: { kind: "group", id: "room-1", label: "Example Room" },
-      route: {
-        agentId: "main",
-        accountId: "work",
-        routeSessionKey: "agent:main:whatsapp:group:room-1",
-      },
-      reply: { to: "whatsapp:room:room-1", replyToId: "quoted-1" },
-      message: {
-        body: "agent body",
-        bodyForAgent: "agent body",
-        rawBody: "raw body",
-        commandBody: "/status",
-      },
-      command: {
-        kind: "text-slash",
-        body: "/status",
-        authorization: { kind: "denied", reason: "sender_not_allowed" },
-      },
-      media: [{ path: "/tmp/example.jpg", contentType: "image/jpeg", kind: "image" }],
-      context: { senderE164: "+15550001111" },
-    } satisfies PreparedChannelInbound;
-
-    const projected = projectPreparedChannelInbound({
-      inbound,
-      control: { messageReceivedHooks: "core" },
-    });
-
-    expect(projected.input).toEqual({
-      id: "event-1",
-      timestamp: 1_710_000_000,
-      rawText: "raw body",
-      textForAgent: "agent body",
-      textForCommands: "/status",
-      raw: inbound,
-    });
-    expect(projected.context).toMatchObject({
-      MessageSid: "event-1",
-      MessageSidFull: "whatsapp:event-1",
-      BodyForAgent: "agent body",
-      RawBody: "raw body",
-      CommandBody: "/status",
-      ReplyToId: "quoted-1",
-      CommandAuthorized: false,
-      ConversationLabel: "Example Room",
-      GroupSubject: "Example Room",
-      SenderE164: "+15550001111",
-      media: [{ path: "/tmp/example.jpg", contentType: "image/jpeg", kind: "image" }],
-    });
   });
 });

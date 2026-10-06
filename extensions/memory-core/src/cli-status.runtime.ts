@@ -1,18 +1,8 @@
-import type { MemoryEmbeddingProbeResult } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import {
-  resolveMemoryLightDreamingConfig,
-  resolveMemoryRemDreamingConfig,
-} from "openclaw/plugin-sdk/memory-core-host-status";
-import {
-  formatAuditCounts,
-  formatExtraPaths,
-  resolveMemoryPluginConfig,
-  scanMemorySources,
-  withMemoryCommand,
-  type MemoryManager,
-  type MemorySourceName,
-  type MemorySourceScan,
-} from "./cli-runtime-common.js";
+  formatMemoryIndexRebuildGuidance,
+  resolveMemoryIndexIdentityDiagnostic,
+  type MemoryEmbeddingProbeResult,
+} from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import {
   defaultRuntime,
   formatErrorMessage,
@@ -21,8 +11,36 @@ import {
   theme,
   withProgress,
   withProgressTotals,
+} from "openclaw/plugin-sdk/memory-core-host-runtime-cli";
+import {
+  getRuntimeConfig,
   type OpenClawConfig,
-} from "./cli.host.runtime.js";
+} from "openclaw/plugin-sdk/memory-core-host-runtime-core";
+import {
+  resolveMemoryLightDreamingConfig,
+  resolveMemoryRemDreamingConfig,
+  resolveMemoryDeepDreamingConfig,
+  resolveMemoryFtsState,
+  resolveMemoryVectorState,
+} from "openclaw/plugin-sdk/memory-core-host-status";
+import { formatByteSize } from "openclaw/plugin-sdk/number-runtime";
+import { asNullableRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  readSelectedMemoryProviderStatus,
+  resolveForeignMemorySlotOwner,
+  type SelectedMemoryProviderStatus,
+} from "./cli-memory-slot.js";
+import {
+  formatAuditCounts,
+  formatExtraPaths,
+  formatMemoryIndexOutcome,
+  resolveMemoryAgentIds,
+  resolveMemoryPluginConfig,
+  scanMemoryManagerSources,
+  withMemoryCommand,
+  type MemoryManager,
+  type MemorySourceScan,
+} from "./cli-runtime-common.js";
 import type { MemoryCommandOptions } from "./cli.types.js";
 import {
   auditDreamingArtifacts,
@@ -30,8 +48,7 @@ import {
   type DreamingArtifactsAuditSummary,
   type RepairDreamingArtifactsResult,
 } from "./dreaming-repair.js";
-import { asRecord } from "./dreaming-shared.js";
-import { resolveShortTermPromotionDreamingConfig } from "./dreaming.js";
+import { formatRecallRepairDetails } from "./dreaming-shared.js";
 import type { MemoryCoreRuntimeHost } from "./memory/runtime-host.js";
 import {
   auditShortTermPromotionArtifacts,
@@ -40,32 +57,21 @@ import {
   type ShortTermAuditSummary,
 } from "./short-term-promotion.js";
 const { accent, heading, info, muted, success, warn } = theme;
+const formatMemoryByteSize = (value: number) =>
+  formatByteSize(value, { style: "iec", maxUnit: "tera", separator: " ", fractionDigits: 1 });
 type LlamaCppRuntimeStatus = {
   state?: string;
   backend?: string;
-  buildType?: string;
-  deviceNames?: string[];
-  memory?: {
-    totalBytes: number;
-    usedBytes: number;
-    freeBytes: number;
-    unifiedBytes: number;
-    observedAtMs: number;
-  };
-  offload?: {
-    supported: boolean;
-    offloadedLayers?: number;
-    totalLayers?: number;
-  };
-  context?: {
-    requestedSize: number | "auto";
-  };
+  buildInfo?: string;
+  model?: { id?: string; path?: string };
+  capabilities?: { vision?: boolean; draft?: boolean };
+  endpoints?: Record<string, string>;
   loadError?: string;
 };
 function readLlamaCppRuntimeStatus(
   status: ReturnType<MemoryManager["status"]>,
 ): LlamaCppRuntimeStatus | null {
-  const runtime = asRecord(asRecord(status.custom)?.llamaCppRuntime);
+  const runtime = asNullableRecord(asNullableRecord(status.custom)?.llamaCppRuntime);
   return runtime?.engine === "llama.cpp" ? (runtime as LlamaCppRuntimeStatus) : null;
 }
 function formatMemoryIndexIdentityWarning(
@@ -74,38 +80,22 @@ function formatMemoryIndexIdentityWarning(
 ): {
   reason: string;
   fix: string;
+  paused: string;
 } | null {
-  const indexIdentity = asRecord(asRecord(status.custom)?.indexIdentity);
-  const reason =
-    (indexIdentity?.status === "mismatched" || indexIdentity?.status === "missing") &&
-    typeof indexIdentity.reason === "string"
-      ? indexIdentity.reason
-      : undefined;
-  if (!reason) {
+  const diagnostic = resolveMemoryIndexIdentityDiagnostic(status);
+  if (!diagnostic) {
     return null;
   }
   return {
-    reason,
-    fix: `Run: openclaw memory status --index --agent ${agentId}`,
+    reason: `${diagnostic.reason} (owner: ${diagnostic.owner}, code: ${diagnostic.code})`,
+    fix: `Run: ${formatMemoryIndexRebuildGuidance(status, agentId)}`,
+    paused: diagnostic.owner === "configuration" ? "paused until memory is rebuilt" : "paused",
   };
-}
-function formatRuntimeBytes(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = bytes / 1024;
-  let unit = units[0];
-  for (let index = 1; index < units.length && value >= 1024; index += 1) {
-    value /= 1024;
-    unit = units[index];
-  }
-  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
 }
 function formatDreamingSummary(cfg: OpenClawConfig): string {
   const pluginConfig = resolveMemoryPluginConfig(cfg);
   const light = resolveMemoryLightDreamingConfig({ pluginConfig, cfg });
-  const deep = resolveShortTermPromotionDreamingConfig({ pluginConfig, cfg });
+  const deep = resolveMemoryDeepDreamingConfig({ pluginConfig, cfg });
   const rem = resolveMemoryRemDreamingConfig({ pluginConfig, cfg });
   const timezone = deep.timezone ?? light.timezone ?? rem.timezone;
   const formatCron = (cron: string) => (timezone ? `${cron} (${timezone})` : cron);
@@ -125,16 +115,7 @@ function formatDreamingSummary(cfg: OpenClawConfig): string {
 function formatRepairSummary(repair: RepairShortTermPromotionArtifactsResult): string {
   const actions: string[] = [];
   if (repair.rewroteStore) {
-    const removedOverflowEntries = repair.removedOverflowEntries ?? 0;
-    const details = [
-      repair.removedInvalidEntries > 0 ? `-${repair.removedInvalidEntries} invalid` : null,
-      (repair.removedDanglingEntries ?? 0) > 0
-        ? `-${repair.removedDanglingEntries} dangling`
-        : null,
-      removedOverflowEntries > 0 ? `-${removedOverflowEntries} overflow` : null,
-    ]
-      .filter(Boolean)
-      .join(", ");
+    const details = formatRecallRepairDetails(repair);
     actions.push(`rewrote store${details ? ` (${details})` : ""}`);
   }
   if (repair.removedStaleLock) {
@@ -169,11 +150,54 @@ function formatDreamingRepairSummary(repair: RepairDreamingArtifactsResult): str
   }
   return actions.length > 0 ? actions.join(" · ") : "no changes";
 }
+// Another plugin owns the memory slot: report that provider, never the sidecar's own index.
+async function runSelectedMemoryProviderStatus(
+  opts: MemoryCommandOptions,
+  cfg: OpenClawConfig,
+  owner: string,
+) {
+  if (opts.deep || opts.index || opts.fix) {
+    defaultRuntime.error(
+      `memory status --deep, --index, and --fix inspect Memory Core's own index, but plugins.slots.memory selects "${owner}". Run "openclaw memory index" to maintain the Memory Core sidecar index.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const results: SelectedMemoryProviderStatus[] = [];
+  for (const agentId of resolveMemoryAgentIds(cfg, opts.agent)) {
+    results.push(await readSelectedMemoryProviderStatus({ cfg, agentId, owner }));
+  }
+  if (opts.json) {
+    defaultRuntime.writeJson(results);
+    return;
+  }
+  const label = (text: string) => muted(`${text}:`);
+  for (const { agentId, provider, health } of results) {
+    const healthColor = health.status === "ready" ? success : warn;
+    const lines = [
+      `${heading("Memory")} ${muted(`(${agentId})`)}`,
+      `${label("Provider")} ${info(provider)} ${muted("(selected memory slot)")}`,
+      `${label("Health")} ${healthColor(health.status)}${health.message ? ` ${muted(health.message)}` : ""}`,
+      `${label("Memory Core")} ${muted("consolidation sidecar only; its index is not this agent's memory")}`,
+      `${label("Dreaming")} ${info(formatDreamingSummary(cfg))}`,
+    ];
+    defaultRuntime.log(lines.join("\n"));
+    defaultRuntime.log("");
+  }
+}
+
 export async function runMemoryStatus(
   opts: MemoryCommandOptions,
   hostOptions?: MemoryCoreRuntimeHost,
 ) {
   setVerbose(Boolean(opts.verbose));
+  const runtimeConfig = getRuntimeConfig({ skipPluginValidation: true });
+  const slotOwner = resolveForeignMemorySlotOwner(runtimeConfig);
+  if (slotOwner) {
+    await runSelectedMemoryProviderStatus(opts, runtimeConfig, slotOwner);
+    return;
+  }
+  const deep = Boolean(opts.deep || opts.index);
   const allResults: Array<{
     agentId: string;
     status: ReturnType<MemoryManager["status"]>;
@@ -190,10 +214,10 @@ export async function runMemoryStatus(
     agent: opts.agent,
     allAgents: true,
     diagnosticsToStderr: Boolean(opts.json),
-    purpose: opts.index ? "cli" : "status",
+    purpose: opts.index || opts.fix ? "cli" : "status",
+    inspectSources: true,
     ...hostOptions,
     run: async ({ manager, agentId }) => {
-      const deep = Boolean(opts.deep || opts.index);
       let embeddingProbe: MemoryEmbeddingProbeResult | undefined;
       let indexError: string | undefined;
       const syncFn = manager.sync ? manager.sync.bind(manager) : undefined;
@@ -257,16 +281,8 @@ export async function runMemoryStatus(
         }
       }
       const status = manager.status();
-      const sources = (status.sources?.length ? status.sources : ["memory"]) as MemorySourceName[];
+      const scan = await scanMemoryManagerSources(status);
       const workspaceDir = status.workspaceDir;
-      const scan = workspaceDir
-        ? await scanMemorySources({
-            workspaceDir,
-            agentId,
-            sources,
-            extraPaths: status.extraPaths,
-          })
-        : undefined;
       let audit: ShortTermAuditSummary | undefined;
       let repair: RepairShortTermPromotionArtifactsResult | undefined;
       let dreamingAudit: DreamingArtifactsAuditSummary | undefined;
@@ -280,18 +296,7 @@ export async function runMemoryStatus(
         if (opts.fix) {
           repair = await repairShortTermPromotionArtifacts({ workspaceDir });
         }
-        const customQmd = asRecord(asRecord(status.custom)?.qmd);
-        audit = await auditShortTermPromotionArtifacts({
-          workspaceDir,
-          qmd:
-            status.backend === "qmd"
-              ? {
-                  dbPath: status.dbPath,
-                  collections:
-                    typeof customQmd?.collections === "number" ? customQmd.collections : undefined,
-                }
-              : undefined,
-        });
+        audit = await auditShortTermPromotionArtifacts({ workspaceDir });
       }
       allResults.push({
         agentId,
@@ -331,7 +336,9 @@ export async function runMemoryStatus(
         ? `${filesIndexed}/? files · ${chunksIndexed} chunks`
         : `${filesIndexed}/${totalFiles} files · ${chunksIndexed} chunks`;
     if (opts.index) {
-      const line = indexError ? `Memory index failed: ${indexError}` : "Memory index complete.";
+      const line = indexError
+        ? `Memory index failed: ${indexError}`
+        : formatMemoryIndexOutcome(status, scan, agentId);
       defaultRuntime.log(line);
     }
     const requestedProvider = status.requestedProvider ?? status.provider;
@@ -354,6 +361,20 @@ export async function runMemoryStatus(
       `${label("Workspace")} ${info(workspacePath)}`,
       `${label("Dreaming")} ${info(formatDreamingSummary(cfg))}`,
     ].filter(Boolean) as string[];
+    if (status.storage) {
+      const storage = status.storage;
+      lines.push(
+        `${label("Agent database")} ${info(formatMemoryByteSize(storage.databaseBytes))} · WAL ${formatMemoryByteSize(storage.walBytes)} · reusable ${formatMemoryByteSize(storage.reusableBytes)}`,
+      );
+      lines.push(
+        `${label("Stored embedding cache")} ${info(formatMemoryByteSize(storage.embeddingCacheBytes))} · ${storage.embeddingCacheEntries} entries`,
+      );
+      lines.push(
+        muted(
+          "Database includes sessions and other agent data. Reusable pages remain allocated until compaction.",
+        ),
+      );
+    }
     if (embeddingProbe) {
       const state =
         embeddingProbe.ok && embeddingProbe.checked === false
@@ -367,37 +388,33 @@ export async function runMemoryStatus(
         lines.push(`${label("Embeddings error")} ${warn(embeddingProbe.error)}`);
       }
     }
-    const llamaCppRuntime = opts.deep ? readLlamaCppRuntimeStatus(status) : null;
-    if (llamaCppRuntime) {
-      const runtime = llamaCppRuntime;
+    const runtime = deep ? readLlamaCppRuntimeStatus(status) : null;
+    if (runtime) {
       const backend = runtime.backend ?? "unknown";
-      const build = runtime.buildType ? ` (${runtime.buildType})` : "";
-      lines.push(`${label("llama.cpp")} ${info(backend)}${muted(build)}`);
-      if (runtime.deviceNames?.length) {
-        lines.push(`${label("Devices")} ${info(runtime.deviceNames.join(", "))}`);
+      const build = runtime.buildInfo ? ` (${runtime.buildInfo})` : "";
+      lines.push(`${label("llama.cpp server")} ${info(backend)}${muted(build)}`);
+      if (runtime.model?.id) {
+        lines.push(`${label("Server model")} ${info(runtime.model.id)}`);
       }
-      if (runtime.memory) {
-        const unified =
-          runtime.memory.unifiedBytes > 0
-            ? ` · ${formatRuntimeBytes(runtime.memory.unifiedBytes)} unified`
-            : "";
+      if (runtime.model?.path) {
+        lines.push(`${label("Model path")} ${info(shortenHomePath(runtime.model.path))}`);
+      }
+      if (runtime.capabilities) {
+        const capabilities = [
+          runtime.capabilities.vision ? "vision" : null,
+          runtime.capabilities.draft ? "draft" : null,
+        ].filter(Boolean);
         lines.push(
-          `${label("VRAM snapshot")} ${info(`${formatRuntimeBytes(runtime.memory.usedBytes)} used · ${formatRuntimeBytes(runtime.memory.freeBytes)} free · ${formatRuntimeBytes(runtime.memory.totalBytes)} total${unified}`)} ${muted(`(${new Date(runtime.memory.observedAtMs).toISOString()})`)}`,
+          `${label("Capabilities")} ${info(capabilities.length ? capabilities.join(", ") : "text only")}`,
         );
       }
-      if (runtime.offload) {
-        const layers =
-          typeof runtime.offload.offloadedLayers === "number" &&
-          typeof runtime.offload.totalLayers === "number"
-            ? `${runtime.offload.offloadedLayers}/${runtime.offload.totalLayers} layers`
-            : runtime.offload.supported
-              ? "supported"
-              : "unsupported";
-        lines.push(`${label("GPU offload")} ${info(layers)}`);
-      }
-      if (runtime.context) {
+      if (runtime.endpoints) {
         lines.push(
-          `${label("Requested context")} ${info(`${runtime.context.requestedSize} tokens`)}`,
+          `${label("Endpoints")} ${info(
+            Object.entries(runtime.endpoints)
+              .map(([name, state]) => `${name}=${state}`)
+              .join(" "),
+          )}`,
         );
       }
       if (runtime.loadError) {
@@ -407,7 +424,7 @@ export async function runMemoryStatus(
     const identityWarning = formatMemoryIndexIdentityWarning(status, agentId);
     if (identityWarning) {
       lines.push(`${label("Index identity")} ${warn(identityWarning.reason)}`);
-      lines.push(`${label("Vector search")} ${warn("paused until memory is rebuilt")}`);
+      lines.push(`${label("Vector search")} ${warn(identityWarning.paused)}`);
       lines.push(`${label("Fix")} ${muted(identityWarning.fix)}`);
     }
     if (status.sourceCounts?.length) {
@@ -420,21 +437,20 @@ export async function runMemoryStatus(
           total === null
             ? `${entry.files}/? files · ${entry.chunks} chunks`
             : `${entry.files}/${total} files · ${entry.chunks} chunks`;
-        lines.push(`  ${accent(entry.source)} ${muted("·")} ${muted(counts)}`);
+        const payload =
+          entry.chunkBytes === undefined
+            ? ""
+            : ` · ${formatMemoryByteSize(entry.chunkBytes)} text + embeddings`;
+        lines.push(`  ${accent(entry.source)} ${muted("·")} ${muted(counts + payload)}`);
       }
     }
     if (status.fallback) {
       lines.push(`${label("Fallback")} ${warn(status.fallback.from)}`);
     }
     if (status.vector) {
+      const vector = status.vector;
       const formatVectorState = (available: boolean | undefined) =>
-        status.vector?.enabled
-          ? available === undefined
-            ? "unknown"
-            : available
-              ? "ready"
-              : "unavailable"
-          : "disabled";
+        resolveMemoryVectorState({ enabled: vector.enabled, available }).state;
       const formatVectorLine = (lineLabel: string, state: string) => {
         const vectorColor = state === "ready" ? success : state === "unavailable" ? warn : muted;
         lines.push(`${label(lineLabel)} ${vectorColor(state)}`);
@@ -471,11 +487,7 @@ export async function runMemoryStatus(
       }
     }
     if (status.fts) {
-      const ftsState = status.fts.enabled
-        ? status.fts.available
-          ? "ready"
-          : "unavailable"
-        : "disabled";
+      const { state: ftsState } = resolveMemoryFtsState(status.fts);
       const ftsColor = ftsState === "ready" ? success : ftsState === "unavailable" ? warn : muted;
       lines.push(`${label("FTS")} ${ftsColor(ftsState)}`);
       if (status.fts.error) {
@@ -508,14 +520,6 @@ export async function runMemoryStatus(
       lines.push(`${label("Recall path")} ${info(shortenHomePath(audit.storePath))}`);
       if (audit.updatedAt) {
         lines.push(`${label("Recall updated")} ${info(audit.updatedAt)}`);
-      }
-      if (status.backend === "qmd" && audit.qmd) {
-        const qmdBits = [
-          audit.qmd.dbPath ? shortenHomePath(audit.qmd.dbPath) : "<unknown>",
-          typeof audit.qmd.dbBytes === "number" ? `${audit.qmd.dbBytes} bytes` : null,
-          typeof audit.qmd.collections === "number" ? `${audit.qmd.collections} collections` : null,
-        ].filter(Boolean);
-        lines.push(`${label("QMD audit")} ${info(qmdBits.join(" · "))}`);
       }
     }
     if (dreamingAudit) {
@@ -553,33 +557,19 @@ export async function runMemoryStatus(
         lines.push(`  ${warn(issue)}`);
       }
     }
-    if (audit?.issues.length) {
-      if (!scan?.issues.length) {
+    let hasIssues = Boolean(scan?.issues.length);
+    for (const report of [audit, dreamingAudit]) {
+      if (!report?.issues.length) {
+        continue;
+      }
+      if (!hasIssues) {
         lines.push(label("Issues"));
       }
-      for (const issue of audit.issues) {
+      hasIssues = true;
+      for (const issue of report.issues) {
         lines.push(`  ${issue.severity === "error" ? warn(issue.message) : muted(issue.message)}`);
       }
-      if (!opts.fix) {
-        // Only a subset of audit issues are repaired by `--fix`; a missing qmd
-        // index needs a reindex instead, so each hint is gated on the matching
-        // issue actually being present.
-        if (audit.issues.some((issue) => issue.fixable)) {
-          lines.push(`  ${muted(`Fix: openclaw memory status --fix --agent ${agentId}`)}`);
-        }
-        if (audit.issues.some((issue) => issue.code === "qmd-index-missing")) {
-          lines.push(`  ${muted(`Fix: openclaw memory index --agent ${agentId}`)}`);
-        }
-      }
-    }
-    if (dreamingAudit?.issues.length) {
-      if (!scan?.issues.length && !audit?.issues.length) {
-        lines.push(label("Issues"));
-      }
-      for (const issue of dreamingAudit.issues) {
-        lines.push(`  ${issue.severity === "error" ? warn(issue.message) : muted(issue.message)}`);
-      }
-      if (!opts.fix && dreamingAudit.issues.some((issue) => issue.fixable)) {
+      if (!opts.fix && report.issues.some((issue) => issue.fixable)) {
         lines.push(`  ${muted(`Fix: openclaw memory status --fix --agent ${agentId}`)}`);
       }
     }

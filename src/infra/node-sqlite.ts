@@ -1,13 +1,22 @@
 // Loads node:sqlite with OpenClaw warning handling.
 import { createRequire } from "node:module";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { ensureSqliteLibrarySelected, getSqliteRuntimeCapabilities } from "./bun-sqlite-library.js";
 import { formatErrorMessage } from "./errors.js";
+import { registerNodeSqliteDisposeCallback } from "./kysely-sync-cache-state.js";
+import { compareValidSemver } from "./semver.js";
+import { registerSqliteReaderConnection } from "./sqlite-reader-lifecycle.js";
 import { isSqliteWalResetSafeVersion } from "./sqlite-runtime-version.js";
-import { isSqliteLockError } from "./sqlite-transaction.js";
+import { trackSqliteSchema } from "./sqlite-schema-facts.js";
 import { installProcessWarningFilter } from "./warning-filter.js";
 
 const require = createRequire(import.meta.url);
 let validatedSqliteModule: typeof import("node:sqlite") | undefined;
+let extensionLoadingSupported = false;
+let jsonbSupported = false;
+// Unqualified runtimes cannot confirm native disposal until the owning worker exits.
+export let bunSqliteNativeCleanupPending = false;
 
 type NodeSqliteDatabaseOptions = ConstructorParameters<
   typeof import("node:sqlite").DatabaseSync
@@ -29,6 +38,32 @@ export function resolveNodeSqliteLocation(location: string): string {
   return resolveSqliteFilesystemPath(location);
 }
 
+/** Preserve native Windows path prefixes before adding SQLite URI parameters. */
+function resolveSqliteFileUriPath(pathname: string, platform: NodeJS.Platform): string {
+  if (platform === "win32") {
+    const namespacedPath = path.win32.toNamespacedPath(path.win32.resolve(pathname));
+    // SQLite separates the query before decoding the Windows namespace prefix.
+    return `file:${encodeURIComponent(namespacedPath)}`;
+  }
+  return pathToFileURL(path.resolve(pathname)).href;
+}
+
+/** Open an existing writable database without SQLite's create-if-missing flag. */
+export function resolveExistingSqliteFileUri(
+  pathname: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return `${resolveSqliteFileUriPath(pathname, platform)}?mode=rw`;
+}
+
+/** Build an immutable SQLite URI without losing the Windows long-path namespace. */
+export function resolveImmutableSqliteFileUri(
+  pathname: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return `${resolveSqliteFileUriPath(pathname, platform)}?mode=ro&immutable=1`;
+}
+
 function assertSqliteWalResetSafeVersion(version: string, nodeVersion: string): void {
   if (isSqliteWalResetSafeVersion(version)) {
     return;
@@ -40,7 +75,7 @@ function assertSqliteWalResetSafeVersion(version: string, nodeVersion: string): 
   const wording = isShared ? "uses shared system" : "embeds";
   const remediation = isShared
     ? "Upgrade the system SQLite library to one of those safe versions, or use a Node build embedding a safe version."
-    : "Upgrade to Node 22.22.3+, 24.15.0+, or 25.9.0+ before retrying.";
+    : "Upgrade to Node 24.16.0+ or 26.1.0+ before retrying.";
   throw new Error(
     `OpenClaw requires SQLite 3.51.3+, 3.50.7+ within 3.50.x, or 3.44.6+ within 3.44.x for WAL safety; ` +
       `Node ${nodeVersion} ${wording} SQLite ${version}, which is affected by the upstream WAL-reset ` +
@@ -61,6 +96,11 @@ function assertSafeSqliteRuntime(sqlite: typeof import("node:sqlite")): void {
       | undefined;
     const version = typeof row?.version === "string" ? row.version : "unknown";
     assertSqliteWalResetSafeVersion(version, process.versions.node);
+    jsonbSupported = (compareValidSemver(version, "3.45.0") ?? -1) >= 0;
+    const capabilities = database
+      .prepare("SELECT sqlite_compileoption_used('OMIT_LOAD_EXTENSION') AS omitted")
+      .get();
+    extensionLoadingSupported = capabilities?.omitted === 0;
     validatedSqliteModule = sqlite;
   } finally {
     database.close();
@@ -73,6 +113,7 @@ function assertSafeSqliteRuntime(sqlite: typeof import("node:sqlite")): void {
 export function requireNodeSqlite(): typeof import("node:sqlite") {
   installProcessWarningFilter();
   try {
+    ensureSqliteLibrarySelected();
     const sqlite = require("node:sqlite") as typeof import("node:sqlite");
     assertSafeSqliteRuntime(sqlite);
     return sqlite;
@@ -84,6 +125,18 @@ export function requireNodeSqlite(): typeof import("node:sqlite") {
   }
 }
 
+/** Whether the loaded SQLite library supports native extensions. */
+export function supportsNodeSqliteExtensionLoading(): boolean {
+  requireNodeSqlite();
+  return extensionLoadingSupported;
+}
+
+/** JSONB is absent from the supported SQLite 3.44 maintenance line. */
+export function supportsNodeSqliteJsonb(): boolean {
+  requireNodeSqlite();
+  return jsonbSupported;
+}
+
 /** Open node:sqlite through OpenClaw's runtime and filesystem-location boundary. */
 export function openNodeSqliteDatabase(
   location: string,
@@ -93,33 +146,14 @@ export function openNodeSqliteDatabase(
   // Callers may pass file: URIs or already-namespaced paths from specialized
   // resolvers; location normalization must remain idempotent for those forms.
   const resolvedLocation = resolveNodeSqliteLocation(location);
-  return options === undefined
-    ? new sqlite.DatabaseSync(resolvedLocation)
-    : new sqlite.DatabaseSync(resolvedLocation, options);
-}
-
-/** Hold a raw exclusive transaction until release for cross-process coordination. */
-export function tryAcquireExclusiveSqliteCoordinator(
-  location: string,
-): { release: () => void } | null {
-  const database = openNodeSqliteDatabase(location);
-  try {
-    // Kysely transaction callbacks cannot own a lock beyond their synchronous commit section.
-    database.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE;");
-  } catch (error) {
-    database.close();
-    if (isSqliteLockError(error)) {
-      return null;
-    }
-    throw error;
+  const database = new sqlite.DatabaseSync(resolvedLocation, options ?? {});
+  // Schema tracking must precede the statement-cache authorizer wrapper.
+  trackSqliteSchema(database, sqlite);
+  if (!getSqliteRuntimeCapabilities().explicitSqliteCloseReleasesNativeResources) {
+    registerNodeSqliteDisposeCallback(database, () => {
+      bunSqliteNativeCleanupPending = true;
+    });
   }
-  return {
-    release: () => {
-      try {
-        database.exec("ROLLBACK");
-      } finally {
-        database.close();
-      }
-    },
-  };
+  registerSqliteReaderConnection(database);
+  return database;
 }

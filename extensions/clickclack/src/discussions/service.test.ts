@@ -1,132 +1,26 @@
 import { describe, expect, it, vi } from "vitest";
 import { ClickClackHttpError, type ClickClackClient } from "../http-client.js";
 import type { ClickClackChannel } from "../types.js";
-import { controlSessionUrl } from "./control-session-url.js";
 import { fallbackDiscussionLabel } from "./naming.js";
-import { MANAGED_CONTRACT_FIELDS, createHarness, testExternalRef } from "./service-test-support.js";
-
-type SessionUrlContractCase = {
-  sessionKey: string;
-  agentId: string;
-  mainKey: string | undefined;
-  expectedPath: string | null;
-};
-
-// Keep in sync with ui/src/app-navigation.test.ts. Core cannot import plugin internals,
-// and this independently published plugin cannot source-import the workspace contract.
-const SESSION_URL_CONTRACT_CASES = [
-  {
-    sessionKey: "agent:main:main",
-    agentId: "main",
-    mainKey: undefined,
-    expectedPath: "/chat/main",
-  },
-  { sessionKey: "main", agentId: "research", mainKey: undefined, expectedPath: "/chat/research" },
-  {
-    sessionKey: "main",
-    agentId: "research",
-    mainKey: "workspace",
-    expectedPath: "/chat/research",
-  },
-  { sessionKey: "main", agentId: "..", mainKey: undefined, expectedPath: "/chat/main" },
-  {
-    sessionKey: "agent:research:workspace",
-    agentId: "main",
-    mainKey: "workspace",
-    expectedPath: "/chat/research",
-  },
-  {
-    sessionKey: "agent:research:main",
-    agentId: "main",
-    mainKey: "workspace",
-    expectedPath: "/chat/research/main",
-  },
-  {
-    sessionKey: "telegram:12345",
-    agentId: "research",
-    mainKey: undefined,
-    expectedPath: "/chat/research/telegram/12345",
-  },
-  {
-    // Dots must be percent-escaped or the server treats the URL as a static asset
-    // request and it never reaches the SPA on refresh or via an external link.
-    sessionKey: "channel:release.js",
-    agentId: "research",
-    mainKey: undefined,
-    expectedPath: "/chat/research/channel/release%2Ejs",
-  },
-  {
-    sessionKey: "agent:main:control-link",
-    agentId: "main",
-    mainKey: undefined,
-    expectedPath: "/chat/main/control-link",
-  },
-  {
-    sessionKey: "agent:main:12345678",
-    agentId: "main",
-    mainKey: undefined,
-    expectedPath: "/chat/main/~key/12345678",
-  },
-  {
-    sessionKey: "agent:main:release-deadbeef",
-    agentId: "main",
-    mainKey: undefined,
-    expectedPath: "/chat/main/~key/release-deadbeef",
-  },
-  {
-    sessionKey: "agent:main:telegram:12345",
-    agentId: "main",
-    mainKey: undefined,
-    expectedPath: "/chat/main/telegram/12345",
-  },
-  {
-    sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef",
-    agentId: "main",
-    mainKey: undefined,
-    expectedPath: "/chat/main/12345678",
-  },
-  {
-    sessionKey: "agent:main:dashboard:deadbeef-0aaa-4000-8000-000000000001",
-    agentId: "main",
-    mainKey: "deadbeef",
-    expectedPath: "/chat/main/deadbeef0",
-  },
-  {
-    sessionKey: "agent:main:cron:..:run",
-    agentId: "main",
-    mainKey: undefined,
-    expectedPath: "/chat/main/cron/~dotdot/run",
-  },
-] satisfies readonly SessionUrlContractCase[];
+import {
+  discussionChannel,
+  MANAGED_CONTRACT_FIELDS,
+  createHarness,
+  testExternalRef,
+} from "./service-test-support.js";
 
 function legacyCreateResponse(
   input: Parameters<ClickClackClient["createChannel"]>[1],
 ): ClickClackChannel {
-  const response: ClickClackChannel = {
-    id: "chn_discussion",
-    route_id: "discussion-route",
-    workspace_id: "wsp_team",
+  const response: ClickClackChannel = discussionChannel({
     ...input,
     kind: "public",
-    created_at: "2026-07-19T00:00:00.000Z",
-  };
+  });
   Reflect.deleteProperty(response, "display_title");
   return response;
 }
 
 describe("ClickClack discussion service", () => {
-  it("matches the Control UI session URL contract vectors", () => {
-    for (const testCase of SESSION_URL_CONTRACT_CASES) {
-      const url = controlSessionUrl(
-        "https://control.example",
-        testCase.sessionKey,
-        testCase.agentId,
-        testCase.mainKey,
-      );
-      expect(url ? new URL(url).pathname : null).toBe(testCase.expectedPath);
-    }
-  });
-
   it("opens a managed channel once and returns stable info URLs", async () => {
     const harness = createHarness({ label: "Release Planning", category: "Projects" });
     harness.config.channels!.clickclack!.apiBaseUrl = "http://127.0.0.1:8484";
@@ -196,21 +90,6 @@ describe("ClickClack discussion service", () => {
     );
   });
 
-  it("records display_title confirmation only when create responses include it", async () => {
-    const modern = createHarness({ label: "Confirmed title" });
-    await modern.service.open("agent:main:confirmed-title");
-    expect(modern.store.lookup("agent:main:confirmed-title")).toMatchObject({
-      displayTitle: "Confirmed title",
-    });
-
-    const legacy = createHarness({ label: "Unconfirmed title" });
-    vi.mocked(legacy.createChannel).mockImplementationOnce(async (_workspaceId, input) =>
-      legacyCreateResponse(input),
-    );
-    await legacy.service.open("agent:main:unconfirmed-title");
-    expect(legacy.store.lookup("agent:main:unconfirmed-title")).not.toHaveProperty("displayTitle");
-  });
-
   it("backfills an unchanged title after a sibling confirms server support", async () => {
     const harness = createHarness({ label: "Needs Backfill" });
     const sessionKey = "agent:main:needs-backfill";
@@ -251,22 +130,26 @@ describe("ClickClack discussion service", () => {
 
   it("pins the configured default for global keys and preserves qualified owners", async () => {
     const globalHarness = createHarness({ label: "Global session" });
-    globalHarness.config.agents = { list: [{ id: "ops", default: true }] };
+    globalHarness.config.agents = { entries: { ops: {} } };
 
     expect(await globalHarness.service.open("global")).toMatchObject({ state: "open" });
     expect(globalHarness.store.lookup("global")).toMatchObject({ agentId: "ops" });
 
     const qualifiedHarness = createHarness({ label: "Qualified session" });
-    qualifiedHarness.config.agents = { list: [{ id: "ops", default: true }] };
+    qualifiedHarness.config.agents = { entries: { ops: {}, worker: {} } };
     const qualifiedKey = "agent:worker:qualified";
 
     expect(await qualifiedHarness.service.open(qualifiedKey)).toMatchObject({ state: "open" });
     expect(qualifiedHarness.store.lookup(qualifiedKey)).toMatchObject({ agentId: "worker" });
+    expect(qualifiedHarness.createChannel).toHaveBeenCalledWith(
+      "wsp_team",
+      expect.objectContaining({ external_url: expect.stringContaining("/chat/worker/") }),
+    );
   });
 
   it("uses the account agent for unscoped links without changing the configured owner", async () => {
     const harness = createHarness({ label: "Telegram peer" });
-    harness.config.agents = { list: [{ id: "ops", default: true }] };
+    harness.config.agents = { entries: { ops: {} } };
     harness.config.channels!.clickclack!.agentId = "research";
 
     await harness.service.open("telegram:12345");
@@ -433,40 +316,19 @@ describe("ClickClack discussion service", () => {
     });
   });
 
-  it("suffixes a desired name when its slug already exists", async () => {
-    const harness = createHarness({ label: "Release Planning" });
-    vi.mocked(harness.channels).mockResolvedValue([
-      {
-        id: "chn_existing",
-        route_id: "existing-route",
-        workspace_id: "wsp_team",
-        name: "release-planning",
-        kind: "public",
-        ...MANAGED_CONTRACT_FIELDS,
-        created_at: "2026-07-19T00:00:00.000Z",
-      },
-    ]);
-    await harness.service.open("agent:main:duplicate-label");
-
-    expect(harness.createChannel).toHaveBeenCalledWith(
-      "wsp_team",
-      expect.objectContaining({ name: "release-planning-2" }),
-    );
-  });
-
   it("falls back after exhausting desired-name suffixes through 20", async () => {
     const harness = createHarness({ label: "Release Planning" });
     const sessionKey = "agent:main:duplicate-label";
     vi.mocked(harness.channels).mockResolvedValue(
-      Array.from({ length: 20 }, (_, index) => ({
-        id: `chn_existing_${index}`,
-        route_id: `existing-route-${index}`,
-        workspace_id: "wsp_team",
-        name: index === 0 ? "release-planning" : `release-planning-${index + 1}`,
-        kind: "public",
-        ...MANAGED_CONTRACT_FIELDS,
-        created_at: "2026-07-19T00:00:00.000Z",
-      })),
+      Array.from({ length: 20 }, (_, index) =>
+        discussionChannel({
+          id: `chn_existing_${index}`,
+          route_id: `existing-route-${index}`,
+          name: index === 0 ? "release-planning" : `release-planning-${index + 1}`,
+          kind: "public",
+          ...MANAGED_CONTRACT_FIELDS,
+        }),
+      ),
     );
 
     await harness.service.open(sessionKey);
@@ -548,31 +410,27 @@ describe("ClickClack discussion service", () => {
     const sessionKey = "agent:main:recover";
     const externalRef = testExternalRef(sessionKey);
     vi.mocked(harness.channels).mockResolvedValue([
-      {
+      discussionChannel({
         id: "chn_recovered",
         route_id: "recovered-route",
-        workspace_id: "wsp_team",
         name: "release-planning",
-        kind: "public",
         external_managed: true,
         external_ref: externalRef,
         external_url: "https://control.example/control/chat/main/release-planning-12345678",
         sidebar_section: "Projects",
-        created_at: "2026-07-19T00:00:00.000Z",
-      },
+      }),
     ]);
-    vi.mocked(harness.updateChannel).mockImplementationOnce(async (_channelId, patch) => ({
-      id: "chn_recovered",
-      route_id: "recovered-route",
-      workspace_id: "wsp_team",
-      name: patch.name ?? "release-planning",
-      kind: "public",
-      external_managed: patch.external_managed,
-      external_ref: patch.external_ref,
-      external_url: patch.external_url,
-      sidebar_section: patch.sidebar_section,
-      created_at: "2026-07-19T00:00:00.000Z",
-    }));
+    vi.mocked(harness.updateChannel).mockImplementationOnce(async (_channelId, patch) =>
+      discussionChannel({
+        id: "chn_recovered",
+        route_id: "recovered-route",
+        name: patch.name ?? "release-planning",
+        external_managed: patch.external_managed,
+        external_ref: patch.external_ref,
+        external_url: patch.external_url,
+        sidebar_section: patch.sidebar_section,
+      }),
+    );
 
     const opened = await harness.service.open(sessionKey);
 
@@ -647,35 +505,31 @@ describe("ClickClack discussion service", () => {
         const externalRef = harness.createChannel.mock.calls[0]?.[1].external_ref;
         return [
           general,
-          {
+          discussionChannel({
             id: "chn_lost_response",
             route_id: "lost-response-route",
-            workspace_id: "wsp_team",
             name: "lost-response",
-            kind: "public",
             external_managed: true,
             external_ref: externalRef,
             external_url: "",
             sidebar_section: "Sessions",
             archived: false,
-            created_at: "2026-07-19T00:00:00.000Z",
-          },
+          }),
         ];
       });
     vi.mocked(harness.createChannel).mockRejectedValueOnce(new Error("connection lost"));
-    vi.mocked(harness.updateChannel).mockImplementationOnce(async (_channelId, patch) => ({
-      id: "chn_lost_response",
-      route_id: "lost-response-route",
-      workspace_id: "wsp_team",
-      name: patch.name ?? "lost-response",
-      kind: "public",
-      external_managed: patch.external_managed ?? true,
-      external_ref: patch.external_ref ?? "",
-      external_url: patch.external_url ?? "",
-      sidebar_section: patch.sidebar_section ?? "Sessions",
-      archived: patch.archived ?? false,
-      created_at: "2026-07-19T00:00:00.000Z",
-    }));
+    vi.mocked(harness.updateChannel).mockImplementationOnce(async (_channelId, patch) =>
+      discussionChannel({
+        id: "chn_lost_response",
+        route_id: "lost-response-route",
+        name: patch.name ?? "lost-response",
+        external_managed: patch.external_managed ?? true,
+        external_ref: patch.external_ref ?? "",
+        external_url: patch.external_url ?? "",
+        sidebar_section: patch.sidebar_section ?? "Sessions",
+        archived: patch.archived ?? false,
+      }),
+    );
 
     await expect(harness.service.open(sessionKey)).resolves.toMatchObject({ state: "open" });
 
@@ -737,19 +591,16 @@ describe("ClickClack discussion service", () => {
         const externalRef = harness.createChannel.mock.calls[0]?.[1].external_ref;
         return [
           general,
-          {
+          discussionChannel({
             id: "chn_adoption_failure",
             route_id: "adoption-failure-route",
-            workspace_id: "wsp_team",
             name: "adoption-failure",
-            kind: "public",
             external_managed: true,
             external_ref: externalRef,
             external_url: "",
             sidebar_section: "Sessions",
             archived: false,
-            created_at: "2026-07-19T00:00:00.000Z",
-          },
+          }),
         ];
       });
     vi.mocked(harness.createChannel).mockRejectedValueOnce(new Error("connection reset"));
@@ -768,19 +619,16 @@ describe("ClickClack discussion service", () => {
     const sessionKey = "agent:main:existing-adoption-failure";
     const externalRef = testExternalRef(sessionKey);
     vi.mocked(harness.channels).mockResolvedValue([
-      {
+      discussionChannel({
         id: "chn_existing_adoption_failure",
         route_id: "existing-adoption-failure-route",
-        workspace_id: "wsp_team",
         name: "existing-adoption-failure",
-        kind: "public",
         external_managed: true,
         external_ref: externalRef,
         external_url: "",
         sidebar_section: "Sessions",
         archived: false,
-        created_at: "2026-07-19T00:00:00.000Z",
-      },
+      }),
     ]);
     vi.mocked(harness.updateChannel).mockRejectedValue(
       new ClickClackHttpError(403, "forbidden", new Headers()),
@@ -800,19 +648,16 @@ describe("ClickClack discussion service", () => {
     const externalRef = testExternalRef(sessionKey);
     vi.mocked(harness.channels)
       .mockResolvedValueOnce([
-        {
+        discussionChannel({
           id: "chn_adopted_conflict",
           route_id: "adopted-conflict-route",
-          workspace_id: "wsp_team",
           name: "adopted-conflict",
-          kind: "public",
           external_managed: true,
           external_ref: externalRef,
           external_url: "",
           sidebar_section: "Sessions",
           archived: false,
-          created_at: "2026-07-19T00:00:00.000Z",
-        },
+        }),
       ])
       .mockRejectedValueOnce(new Error("relist unavailable"));
     vi.mocked(harness.updateChannel).mockRejectedValueOnce(
@@ -843,33 +688,29 @@ describe("ClickClack discussion service", () => {
     const externalRef = harness.createChannel.mock.calls[0]?.[1].external_ref;
     harness.setSessionEntry({ sessionId: "new-session", label: "Ambiguous reset" });
     vi.mocked(harness.channels).mockResolvedValue([
-      {
+      discussionChannel({
         id: "chn_ambiguous_old",
         route_id: "ambiguous-old-route",
-        workspace_id: "wsp_team",
         name: "ambiguous-reset",
-        kind: "public",
         external_managed: true,
         external_ref: externalRef,
         external_url: "",
         sidebar_section: "Sessions",
         archived: false,
-        created_at: "2026-07-19T00:00:00.000Z",
-      },
+      }),
     ]);
-    vi.mocked(harness.updateChannel).mockImplementationOnce(async (channelId, patch) => ({
-      id: channelId,
-      route_id: "ambiguous-old-route",
-      workspace_id: "wsp_team",
-      name: patch.name ?? "ambiguous-reset",
-      kind: "public",
-      external_managed: patch.external_managed ?? true,
-      external_ref: patch.external_ref ?? externalRef,
-      external_url: patch.external_url,
-      sidebar_section: patch.sidebar_section,
-      archived: false,
-      created_at: "2026-07-19T00:00:00.000Z",
-    }));
+    vi.mocked(harness.updateChannel).mockImplementationOnce(async (channelId, patch) =>
+      discussionChannel({
+        id: channelId,
+        route_id: "ambiguous-old-route",
+        name: patch.name ?? "ambiguous-reset",
+        external_managed: patch.external_managed ?? true,
+        external_ref: patch.external_ref ?? externalRef,
+        external_url: patch.external_url,
+        sidebar_section: patch.sidebar_section,
+        archived: false,
+      }),
+    );
 
     await harness.service.open(sessionKey);
 
@@ -903,19 +744,16 @@ describe("ClickClack discussion service", () => {
       archivedAt: 1,
     });
     vi.mocked(harness.channels).mockResolvedValue([
-      {
+      discussionChannel({
         id: "chn_archived_ambiguous",
         route_id: "archived-ambiguous-route",
-        workspace_id: "wsp_team",
         name: "archived-during-create",
-        kind: "public",
         external_managed: true,
         external_ref: externalRef,
         external_url: "",
         sidebar_section: "Sessions",
         archived: false,
-        created_at: "2026-07-19T00:00:00.000Z",
-      },
+      }),
     ]);
 
     await harness.service.reconcileAll();
@@ -932,19 +770,18 @@ describe("ClickClack discussion service", () => {
       sessionId: "new-session",
       label: "Archived during create",
     });
-    vi.mocked(harness.updateChannel).mockImplementationOnce(async (channelId, patch) => ({
-      id: channelId,
-      route_id: "archived-ambiguous-route",
-      workspace_id: "wsp_team",
-      name: patch.name ?? "archived-during-create",
-      kind: "public",
-      external_managed: patch.external_managed ?? true,
-      external_ref: patch.external_ref ?? externalRef,
-      external_url: patch.external_url,
-      sidebar_section: patch.sidebar_section,
-      archived: false,
-      created_at: "2026-07-19T00:00:00.000Z",
-    }));
+    vi.mocked(harness.updateChannel).mockImplementationOnce(async (channelId, patch) =>
+      discussionChannel({
+        id: channelId,
+        route_id: "archived-ambiguous-route",
+        name: patch.name ?? "archived-during-create",
+        external_managed: patch.external_managed ?? true,
+        external_ref: patch.external_ref ?? externalRef,
+        external_url: patch.external_url,
+        sidebar_section: patch.sidebar_section,
+        archived: false,
+      }),
+    );
 
     await expect(harness.service.open(sessionKey)).resolves.toMatchObject({ state: "open" });
 
@@ -978,19 +815,16 @@ describe("ClickClack discussion service", () => {
     const externalRef = harness.createChannel.mock.calls[0]?.[1].external_ref;
     harness.config.channels!.clickclack!.discussions!.enabled = false;
     vi.mocked(harness.channels).mockResolvedValue([
-      {
+      discussionChannel({
         id: "chn_disabled_pending",
         route_id: "disabled-pending-route",
-        workspace_id: "wsp_team",
         name: "disable-during-create",
-        kind: "public",
         external_managed: true,
         external_ref: externalRef,
         external_url: "",
         sidebar_section: "Sessions",
         archived: false,
-        created_at: "2026-07-19T00:00:00.000Z",
-      },
+      }),
     ]);
 
     await harness.service.reconcileAll();
@@ -1032,19 +866,16 @@ describe("ClickClack discussion service", () => {
       },
     };
     vi.mocked(harness.channels).mockResolvedValue([
-      {
+      discussionChannel({
         id: "chn_old_account",
         route_id: "old-account-route",
-        workspace_id: "wsp_team",
         name: "account-replacement",
-        kind: "public",
         external_managed: true,
         external_ref: externalRef,
         external_url: "",
         sidebar_section: "Sessions",
         archived: false,
-        created_at: "2026-07-19T00:00:00.000Z",
-      },
+      }),
     ]);
 
     await expect(harness.service.open(sessionKey)).resolves.toMatchObject({ state: "open" });
@@ -1060,36 +891,6 @@ describe("ClickClack discussion service", () => {
   it("does not create or adopt a room for an archived main session", async () => {
     const harness = createHarness({ label: "Recovered Name", archivedAt: 123 });
     const sessionKey = "agent:main:recover-stale";
-    const externalRef = testExternalRef(sessionKey);
-    vi.mocked(harness.channels).mockResolvedValue([
-      {
-        id: "chn_recovered",
-        route_id: "recovered-route",
-        workspace_id: "wsp_team",
-        name: "old-name",
-        kind: "public",
-        external_managed: true,
-        external_ref: externalRef,
-        external_url: "https://control.example/control/chat/main/release-planning-12345678",
-        sidebar_section: "Sessions",
-        archived: false,
-        created_at: "2026-07-19T00:00:00.000Z",
-      },
-    ]);
-    vi.mocked(harness.updateChannel).mockImplementationOnce(async (_channelId, patch) => ({
-      id: "chn_recovered",
-      route_id: "recovered-route",
-      workspace_id: "wsp_team",
-      name: "old-name",
-      kind: "public",
-      external_managed: patch.external_managed,
-      external_ref: patch.external_ref,
-      external_url: patch.external_url,
-      sidebar_section: patch.sidebar_section,
-      archived: false,
-      created_at: "2026-07-19T00:00:00.000Z",
-    }));
-
     await expect(harness.service.open(sessionKey)).resolves.toEqual({ state: "available" });
     expect(harness.channels).not.toHaveBeenCalled();
     expect(harness.updateChannel).not.toHaveBeenCalled();

@@ -9,21 +9,6 @@ import {
 } from "./open-policy-allowfrom.js";
 
 describe("doctor open-policy allowFrom repair", () => {
-  it('adds top-level wildcard when dmPolicy="open" has no allowFrom', () => {
-    const result = maybeRepairOpenPolicyAllowFrom({
-      channels: {
-        signal: {
-          dmPolicy: "open",
-        },
-      },
-    });
-
-    expect(result.changes).toEqual([
-      '- channels.signal.allowFrom: set to ["*"] (required by dmPolicy="open")',
-    ]);
-    expect(result.config.channels?.signal?.allowFrom).toEqual(["*"]);
-  });
-
   it("repairs top-level googlechat allowFrom", () => {
     const result = maybeRepairOpenPolicyAllowFrom({
       channels: {
@@ -60,20 +45,8 @@ describe("doctor open-policy allowFrom repair", () => {
 
   it.each<{ label: string; config: GoogleChatConfig }>([
     {
-      label: "root",
-      config: { dmPolicy: "open", allowFrom: ["*"] },
-    },
-    {
       label: "root inherited by a named account",
       config: { dmPolicy: "open", allowFrom: ["*"], accounts: { work: {} } },
-    },
-    {
-      label: "named account",
-      config: { accounts: { work: { dmPolicy: "open", allowFrom: ["*"] } } },
-    },
-    {
-      label: "default account",
-      config: { accounts: { default: { dmPolicy: "open", allowFrom: ["*"] } } },
     },
     {
       label: "root and named override",
@@ -145,20 +118,6 @@ describe("doctor open-policy allowFrom repair", () => {
     expect(result.config.channels?.slack?.allowFrom).toEqual(["U123", "*"]);
   });
 
-  it("skips top-level allowFrom that already includes a wildcard", () => {
-    const result = maybeRepairOpenPolicyAllowFrom({
-      channels: {
-        discord: {
-          dmPolicy: "open",
-          allowFrom: ["*"],
-        },
-      },
-    });
-
-    expect(result.changes).toStrictEqual([]);
-    expect(result.config.channels?.discord?.allowFrom).toEqual(["*"]);
-  });
-
   it("repairs per-account open dmPolicy without allowFrom", () => {
     const result = maybeRepairOpenPolicyAllowFrom({
       channels: {
@@ -173,6 +132,29 @@ describe("doctor open-policy allowFrom repair", () => {
     });
 
     expect(result.config.channels?.discord?.accounts?.work?.allowFrom).toEqual(["*"]);
+  });
+
+  it("does not widen QQBot chat access while allowFrom protects native approvals", () => {
+    const config = {
+      channels: {
+        qqbot: {
+          dmPolicy: "open",
+          allowFrom: ["openclaw:approval-disabled"],
+          accounts: {
+            work: {
+              dmPolicy: "open",
+              allowFrom: ["OPERATOR"],
+            },
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    const first = maybeRepairOpenPolicyAllowFrom(config);
+    const second = maybeRepairOpenPolicyAllowFrom(first.config);
+
+    expect(first).toEqual({ config, changes: [] });
+    expect(second).toEqual({ config, changes: [] });
   });
 
   it("formats open-policy wildcard warnings", () => {

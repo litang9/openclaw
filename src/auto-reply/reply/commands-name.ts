@@ -1,7 +1,4 @@
-import {
-  normalizeOptionalLowercaseString,
-  normalizeOptionalString,
-} from "@openclaw/normalization-core/string-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
   applySessionPatchProjection,
   loadSessionEntryReadOnly,
@@ -11,20 +8,10 @@ import { deriveSessionTitle } from "../../gateway/session-utils.js";
 import { parseSessionLabel } from "../../sessions/session-label.js";
 import { commandReply as nameReply, defineAuthorizedTextCommand } from "./command-gates.js";
 import { markCommandSessionMetadataChanged } from "./command-session-metadata.js";
+import { matchSlashCommandToken } from "./commands-slash-parse.js";
 import type { CommandHandler, HandleCommandsParams } from "./commands-types.js";
 
 const NAME_COMMAND_PREFIX = "/name";
-
-function parseNameCommand(raw: string): { title: string } | null {
-  const trimmed = raw.trim();
-  const commandEnd = trimmed.search(/\s/);
-  const commandToken = commandEnd === -1 ? trimmed : trimmed.slice(0, commandEnd);
-  if (normalizeOptionalLowercaseString(commandToken) !== NAME_COMMAND_PREFIX) {
-    return null;
-  }
-  const argText = commandEnd === -1 ? "" : trimmed.slice(commandEnd).trim();
-  return { title: argText };
-}
 
 function syncNameSessionEntry(params: HandleCommandsParams): void {
   if (!params.sessionStore || !params.sessionKey || !params.storePath) {
@@ -42,13 +29,13 @@ function syncNameSessionEntry(params: HandleCommandsParams): void {
 }
 
 export const handleNameCommand: CommandHandler = defineAuthorizedTextCommand(
-  { label: "/name", match: parseNameCommand },
-  async (params, parsed) => {
+  { label: "/name", match: (body) => matchSlashCommandToken(body, NAME_COMMAND_PREFIX) },
+  async (params, rawTitle) => {
     if (!params.storePath || !params.sessionKey) {
       return nameReply("Naming is not available for this session.");
     }
 
-    const title = normalizeOptionalString(parsed.title);
+    const title = normalizeOptionalString(rawTitle);
 
     // No argument: surface the current name plus a deterministic suggestion
     // derived locally (no LLM, no mutation). Apply it with `/name <title>`.
@@ -78,7 +65,7 @@ export const handleNameCommand: CommandHandler = defineAuthorizedTextCommand(
     const result = await applySessionPatchProjection<{ ok: false; error: string }>({
       storePath,
       resolveTarget: () => ({ primaryKey: sessionKey, candidateKeys: [sessionKey] }),
-      project: ({ entries, existingEntry }) => {
+      project: ({ existingEntry, isLabelInUse }) => {
         // Native slash may invoke `/name` before the fast path persists the entry.
         // Seed a copy under the canonical key without mutating params on failed writes.
         const entry =
@@ -90,10 +77,8 @@ export const handleNameCommand: CommandHandler = defineAuthorizedTextCommand(
         if (!validated.ok) {
           return { ok: false, error: validated.error };
         }
-        for (const other of entries) {
-          if (other.sessionKey !== sessionKey && other.entry.label === validated.label) {
-            return { ok: false, error: `label already in use: ${validated.label}` };
-          }
+        if (isLabelInUse(validated.label)) {
+          return { ok: false, error: `label already in use: ${validated.label}` };
         }
         entry.label = validated.label;
         entry.updatedAt = Math.max(entry.updatedAt ?? 0, Date.now());

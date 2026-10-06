@@ -5,12 +5,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveAgentRuntimeConfig } from "../agents/agent-runtime-config.js";
 import { resolveSession } from "../agents/command/session.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { createThrowingTestRuntime } from "./test-runtime-config-helpers.js";
 
 type ConfigSnapshotForWrite = {
   snapshot: { valid: boolean; resolved: OpenClawConfig };
-  writeOptions: Record<string, never>;
+  writeOptions: { basePluginMetadataSnapshot?: PluginMetadataSnapshot };
 };
 
 type ResolveCommandConfigParams = {
@@ -88,23 +89,36 @@ const setRuntimeConfigSnapshotMock = vi.hoisted(() =>
   vi.fn<(cfg: OpenClawConfig, sourceConfig: OpenClawConfig) => void>(),
 );
 vi.mock("../config/runtime-snapshot.js", () => ({
+  getRuntimeConfigSourceSnapshot: () => null,
+  registerRuntimeConfigSnapshotPreparer: vi.fn(),
   setRuntimeConfigSnapshot: setRuntimeConfigSnapshotMock,
 }));
 
-const getActiveSecretsRuntimeSnapshotMock = vi.hoisted(() => vi.fn<() => object | null>());
+const getActiveSecretsRuntimeConfigSnapshotMock = vi.hoisted(() =>
+  vi.fn<typeof import("../secrets/runtime-state.js").getActiveSecretsRuntimeConfigSnapshot>(),
+);
+vi.mock("../secrets/runtime-state.js", () => ({
+  getActiveSecretsRuntimeConfigSnapshot: getActiveSecretsRuntimeConfigSnapshotMock,
+}));
 const prepareSecretsRuntimeSnapshotMock = vi.hoisted(() =>
-  vi.fn(async (params: { config: OpenClawConfig; assignmentConfig: OpenClawConfig }) => ({
-    sourceConfig: params.config,
-    config: params.assignmentConfig,
-    authStores: [],
-    authStoreCredentialsRevision: 0,
-    warnings: [],
-    webTools: {},
-  })),
+  vi.fn(
+    async (params: {
+      config: OpenClawConfig;
+      assignmentConfig: OpenClawConfig;
+      pluginMetadataSnapshot?: Pick<PluginMetadataSnapshot, "plugins" | "manifestRegistry">;
+    }) => ({
+      sourceConfig: params.config,
+      config: params.assignmentConfig,
+      authStores: [],
+      authStoreCredentialsRevision: 0,
+      authStoreSnapshotsRevision: 0,
+      warnings: [],
+      webTools: {},
+    }),
+  ),
 );
 const activateSecretsRuntimeSnapshotMock = vi.hoisted(() => vi.fn());
 vi.mock("../secrets/runtime.js", () => ({
-  getActiveSecretsRuntimeSnapshot: getActiveSecretsRuntimeSnapshotMock,
   prepareSecretsRuntimeSnapshot: prepareSecretsRuntimeSnapshotMock,
   activateSecretsRuntimeSnapshot: activateSecretsRuntimeSnapshotMock,
 }));
@@ -154,7 +168,11 @@ function mockConfig(home: string, storePath: string): OpenClawConfig {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  getActiveSecretsRuntimeSnapshotMock.mockReturnValue({});
+  getActiveSecretsRuntimeConfigSnapshotMock.mockImplementation(() => ({
+    config: loadConfigMock(),
+    sourceConfig: loadConfigMock(),
+    configRefsPrepared: true,
+  }));
   readConfigFileSnapshotForWriteMock.mockResolvedValue({
     snapshot: { valid: false, resolved: {} as OpenClawConfig },
     writeOptions: {},
@@ -167,11 +185,15 @@ describe("agentCommand runtime config", () => {
       const store = path.join(home, "sessions.json");
       const loadedConfig = mockConfig(home, store);
       const sourceConfig = { ...loadedConfig, secrets: { providers: {} } } as OpenClawConfig;
+      const pluginMetadataSnapshot = {
+        plugins: [],
+        manifestRegistry: { plugins: [], diagnostics: [] },
+      } as unknown as PluginMetadataSnapshot;
       readConfigFileSnapshotForWriteMock.mockResolvedValue({
         snapshot: { valid: true, resolved: sourceConfig },
-        writeOptions: {},
+        writeOptions: { basePluginMetadataSnapshot: pluginMetadataSnapshot },
       });
-      getActiveSecretsRuntimeSnapshotMock.mockReturnValue(null);
+      getActiveSecretsRuntimeConfigSnapshotMock.mockReturnValue(null);
 
       await resolveAgentRuntimeConfig(runtime);
 
@@ -179,7 +201,11 @@ describe("agentCommand runtime config", () => {
         config: sourceConfig,
         assignmentConfig: loadedConfig,
         includeConfigRefs: false,
+        pluginMetadataSnapshot,
       });
+      expect(prepareSecretsRuntimeSnapshotMock.mock.calls[0]?.[0].pluginMetadataSnapshot).toBe(
+        pluginMetadataSnapshot,
+      );
       expect(activateSecretsRuntimeSnapshotMock).toHaveBeenCalledWith(
         expect.objectContaining({ sourceConfig, config: loadedConfig }),
       );
@@ -190,37 +216,17 @@ describe("agentCommand runtime config", () => {
   it("sets runtime snapshots from source config before embedded agent run", async () => {
     await withTempHome(async (home) => {
       const store = path.join(home, "sessions.json");
-      const loadedConfig = {
-        agents: {
-          defaults: {
-            model: { primary: "anthropic/claude-opus-4-6" },
-            models: { "anthropic/claude-opus-4-6": {} },
-            workspace: path.join(home, "openclaw"),
+      const loadedConfig = mockConfig(home, store);
+      loadedConfig.models = {
+        providers: {
+          openai: {
+            baseUrl: "https://api.openai.com/v1",
+            apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
+            models: [],
           },
         },
-        session: { store, mainKey: "main" },
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
-              models: [],
-            },
-          },
-        },
-      } as unknown as OpenClawConfig;
-      const sourceConfig = {
-        ...loadedConfig,
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
-              models: [],
-            },
-          },
-        },
-      } as unknown as OpenClawConfig;
+      };
+      const sourceConfig = structuredClone(loadedConfig);
       const resolvedConfig = {
         ...loadedConfig,
         models: {
@@ -238,6 +244,11 @@ describe("agentCommand runtime config", () => {
       readConfigFileSnapshotForWriteMock.mockResolvedValue({
         snapshot: { valid: true, resolved: sourceConfig },
         writeOptions: {},
+      });
+      getActiveSecretsRuntimeConfigSnapshotMock.mockReturnValue({
+        config: loadedConfig,
+        sourceConfig,
+        configRefsPrepared: true,
       });
       resolveCommandConfigWithSecretsMock.mockResolvedValueOnce({
         resolvedConfig,
@@ -258,7 +269,7 @@ describe("agentCommand runtime config", () => {
       expect(targetIds.has("models.providers.*.apiKey")).toBe(true);
       expect(targetIds.has("channels.telegram.botToken")).toBe(false);
       expect(setRuntimeConfigSnapshotMock).toHaveBeenCalledWith(resolvedConfig, sourceConfig);
-      expect(prepared.cfg).toBe(resolvedConfig);
+      expect(prepared).toBe(resolvedConfig);
     });
   });
 
@@ -407,10 +418,10 @@ describe("agentCommand runtime config", () => {
 
       const prepared = await resolveAgentRuntimeConfig(runtime);
 
-      expect(readConfigFileSnapshotForWriteMock).toHaveBeenCalledTimes(1);
+      expect(readConfigFileSnapshotForWriteMock).not.toHaveBeenCalled();
       expect(resolveCommandConfigWithSecretsMock).not.toHaveBeenCalled();
-      expect(setRuntimeConfigSnapshotMock).toHaveBeenCalledWith(loadedConfig, loadedConfig);
-      expect(prepared.cfg).toBe(loadedConfig);
+      expect(setRuntimeConfigSnapshotMock).not.toHaveBeenCalled();
+      expect(prepared).toBe(loadedConfig);
     });
   });
 
@@ -494,7 +505,7 @@ describe("agentCommand runtime config", () => {
       const store = path.join(home, "sessions.json");
       const cfg = mockConfig(home, store);
 
-      const resolved = resolveSession({ cfg, to: "+1555" });
+      const resolved = await resolveSession({ cfg, to: "+1555" });
 
       expect(resolved.storePath).toBe(store);
       expect(resolved.sessionKey).toBeTypeOf("string");

@@ -1,4 +1,3 @@
-// Memory Core plugin module implements cli metadata behavior.
 import { definePluginEntry } from "openclaw/plugin-sdk/core";
 import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
 
@@ -14,7 +13,6 @@ export default definePluginEntry({
           acquireLocalService: api.runtime.llm?.acquireLocalService,
           openKeyedStore: <T>(options: OpenKeyedStoreOptions) =>
             api.runtime.state.openKeyedStore<T>(options),
-          withLease: api.runtime.state.withLease.bind(api.runtime.state),
         });
       },
       {

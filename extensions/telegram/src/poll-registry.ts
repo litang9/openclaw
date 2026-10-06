@@ -1,10 +1,8 @@
-// Telegram plugin module implements public-poll vote routing registry behavior.
-//
 // Telegram only emits `poll_answer` updates for non-anonymous (public) polls, and those
 // updates do not carry the originating chat/thread. Persist the authoritative route
 // returned by sendPoll so a later vote can enter the normal inbound turn pipeline.
 import type { Chat } from "grammy/types";
-import { parseStrictInteger } from "openclaw/plugin-sdk/number-runtime";
+import { parseStrictInteger, parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
 import type {
   PluginStateKeyedStore,
   PluginStateSyncKeyedStore,
@@ -23,7 +21,7 @@ export type TelegramPollRegistryEntry = {
   pollId: string;
   chat: TelegramPollRouteChat;
   messageId: number;
-  messageThreadId?: number;
+  threadSpec: { scope: "none" } | { scope: "dm"; id?: number } | { scope: "forum"; id: number };
   question: string;
   options: string[];
 };
@@ -57,7 +55,7 @@ export function telegramPollRegistryKey(accountId: string | undefined, pollId: s
 }
 
 function normalizePollChat(raw: unknown): TelegramPollRouteChat | null {
-  if (!isRecord(raw)) {
+  if (!isRecord(raw) || raw.is_direct_messages === true) {
     return null;
   }
   const id = parseStrictInteger(raw.id);
@@ -81,21 +79,45 @@ function normalizePollChat(raw: unknown): TelegramPollRouteChat | null {
   return null;
 }
 
+function normalizePollThreadSpec(
+  raw: unknown,
+  chat: TelegramPollRouteChat,
+): TelegramPollRegistryEntry["threadSpec"] | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const id = parseStrictPositiveInteger(raw.id);
+  if (raw.scope === "none") {
+    return raw.id === undefined && chat.type !== "private" && chat.is_forum !== true
+      ? { scope: "none" }
+      : null;
+  }
+  if (raw.scope === "dm") {
+    if (chat.type !== "private" || (raw.id !== undefined && id === undefined)) {
+      return null;
+    }
+    return id === undefined ? { scope: "dm" } : { scope: "dm", id };
+  }
+  return raw.scope === "forum" && chat.type === "supergroup" && id !== undefined
+    ? { scope: "forum", id }
+    : null;
+}
+
 function normalizePollRegistryEntry(raw: unknown): TelegramPollRegistryEntry | null {
   if (!isRecord(raw)) {
     return null;
   }
   const chat = normalizePollChat(raw.chat);
   const messageId = parseStrictInteger(raw.messageId);
-  const messageThreadId = parseStrictInteger(raw.messageThreadId);
+  const threadSpec = chat ? normalizePollThreadSpec(raw.threadSpec, chat) : null;
   if (
     typeof raw.pollId !== "string" ||
     !chat ||
+    !threadSpec ||
     messageId === undefined ||
     typeof raw.question !== "string" ||
     !Array.isArray(raw.options) ||
-    !raw.options.every((option) => typeof option === "string") ||
-    (raw.messageThreadId != null && messageThreadId === undefined)
+    !raw.options.every((option) => typeof option === "string")
   ) {
     return null;
   }
@@ -103,22 +125,18 @@ function normalizePollRegistryEntry(raw: unknown): TelegramPollRegistryEntry | n
     pollId: raw.pollId,
     chat,
     messageId,
-    ...(messageThreadId === undefined ? {} : { messageThreadId }),
+    threadSpec,
     question: raw.question,
     options: raw.options,
   };
 }
 
-export async function recordTelegramPollRegistryEntry(params: {
-  accountId?: string;
-  pollId: string;
-  chat: TelegramPollRouteChat;
-  messageId: number;
-  messageThreadId?: number;
-  question: string;
-  options: string[];
-  env?: NodeJS.ProcessEnv;
-}): Promise<TelegramPollRegistryEntry> {
+export async function recordTelegramPollRegistryEntry(
+  params: TelegramPollRegistryEntry & {
+    accountId?: string;
+    env?: NodeJS.ProcessEnv;
+  },
+): Promise<TelegramPollRegistryEntry> {
   const entry = createTelegramPollRegistryEntry(params);
   await openPollRegistryStore(params.env).register(
     telegramPollRegistryKey(params.accountId, params.pollId),
@@ -127,26 +145,17 @@ export async function recordTelegramPollRegistryEntry(params: {
   return entry;
 }
 
-export function createTelegramPollRegistryEntry(params: {
-  pollId: string;
-  chat: TelegramPollRouteChat;
-  messageId: number;
-  messageThreadId?: number;
-  question: string;
-  options: string[];
-}): TelegramPollRegistryEntry {
-  // The keyed store persists JSON and rejects explicit `undefined`, so only include the
-  // optional thread id when it is actually present.
-  return {
-    pollId: params.pollId,
-    chat: params.chat,
-    messageId: params.messageId,
-    question: params.question,
+export function createTelegramPollRegistryEntry(
+  params: TelegramPollRegistryEntry,
+): TelegramPollRegistryEntry {
+  const entry = normalizePollRegistryEntry({
+    ...params,
     options: [...params.options],
-    ...(typeof params.messageThreadId === "number"
-      ? { messageThreadId: Math.floor(params.messageThreadId) }
-      : {}),
-  };
+  });
+  if (!entry) {
+    throw new Error("Invalid Telegram poll registry route");
+  }
+  return entry;
 }
 
 export async function findTelegramPollRegistryEntry(params: {
@@ -162,6 +171,7 @@ export async function findTelegramPollRegistryEntry(params: {
   return normalizePollRegistryEntry(stored);
 }
 
+/** Retained for hosts whose ingress monitor does not support inspectAsync. */
 export function findTelegramPollRegistryEntrySync(params: {
   accountId?: string;
   pollId: string;

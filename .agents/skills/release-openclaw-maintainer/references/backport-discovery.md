@@ -1,8 +1,7 @@
 # Evidence-Driven Backport Discovery
 
 Use this before selecting backports for any OpenClaw release line: regular
-beta/stable, extended-stable, alpha/nightly when it reuses an older release
-base, or a release-repair branch. It is an audit before the candidate is
+beta/stable, extended-stable, or a release-repair branch. It is an audit before the candidate is
 mutated, not a title search and not permission to expand a frozen release.
 
 ## Freeze the Audit
@@ -29,6 +28,33 @@ dependency groups, and carry-forward blocked items. Security rows in public
 evidence must remain opaque; retain private identifiers only in the approved
 security record. The next accepted audit uses this ledger's `scan_end` as its
 cursor.
+
+## Reconcile Stable-Maturity Issues
+
+At the pinned `origin/main` SHA, snapshot all OpenClaw issues carrying
+`maturity:stable` and record the query time with the audit bounds. This is a
+secondary completeness and priority check over the commit inventory, not a
+replacement for it. The label means the current issue review matched broken
+existing behavior to a primary M4/M5 scorecard surface; it does not prove the
+issue, identify a complete fix, approve a backport, or block a release by
+itself.
+
+For each labelled issue, whether open or closed, whose fixing PR or commit
+actually landed in the scan range, link that fix to its commit-ledger row and
+require an ordinary `backport`, `already-covered`, `not-affected`, `blocked`,
+or `skip` decision. Do not omit a commit based on its linked issue's state, and
+do not add one merely because the issue has this label. For each open P0/P1
+labelled issue, add a release-readiness disposition: fixed by the candidate,
+not affected on the release baseline, explicitly deferred by a maintainer, or
+blocked because no proven fix exists. Open issues without a merged fix are not
+backport candidates.
+
+Read the current review rationale before relying on the signal. If the issue is
+a feature proposal, new config or policy request, docs/support work, or is
+primarily owned by a below-M4 surface, record `label-drift` in the audit and do
+not treat it as a maturity candidate. Release discovery reports drift but does
+not mutate issue labels. Keep the underlying commit and security inventory
+complete even when label data is missing, stale, or wrong.
 
 ## Find Reliability and Security Candidates
 
@@ -75,7 +101,11 @@ out-of-scope, and blocked items with the evidence that led to the decision.
 
 Exclude features, migrations, new configuration, new runtime requirements, and
 broad redesigns unless a maintainer explicitly approves their inclusion. Do not
-substitute convenient dependency bumps for a complete candidate audit.
+substitute convenient dependency bumps for a complete candidate audit. A
+backport is a cherry-pick of a merged `main` commit onto the release branch;
+never re-cut the candidate from newer `main` to absorb one unless Peter
+explicitly asks for it in that release. After dispatch, only confirmed release
+blockers qualify, each named in the handoff record.
 
 Before changing release refs, present the complete categorized ledger and the
 proposed set for maintainer approval. After approval, backport with provenance,

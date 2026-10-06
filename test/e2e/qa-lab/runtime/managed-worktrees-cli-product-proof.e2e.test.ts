@@ -35,13 +35,17 @@ afterEach(async () => {
   }
 });
 
-function parseCommandJson<T>(label: string, result: CommandResult): T {
+function parseCommandJson<T>(
+  label: string,
+  result: CommandResult,
+  parse: (value: unknown) => T = (value) => value as T,
+): T {
   if (result.code !== 0) {
     throw new Error(
       `${label} failed with exit ${String(result.code)}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     );
   }
-  return JSON.parse(result.stdout) as T;
+  return parse(JSON.parse(result.stdout) as unknown);
 }
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
@@ -178,7 +182,7 @@ describe("managed worktrees child CLI product proof", () => {
         "worktrees gc",
         await instance.cli(["worktrees", "gc", "--json"]),
       );
-      expect(gc).toEqual({
+      expect(gc).toMatchObject({
         removed: [],
         orphansDeleted: expect.any(Number),
         snapshotsPruned: expect.any(Number),

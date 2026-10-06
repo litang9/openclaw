@@ -1,4 +1,5 @@
 import { setImmediate as waitForImmediate } from "node:timers/promises";
+import { rawDataToString } from "@openclaw/gateway-client/websocket-data";
 import { PROTOCOL_VERSION } from "@openclaw/gateway-protocol/version";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type RawData, type WebSocket, WebSocketServer } from "ws";
@@ -7,6 +8,7 @@ import {
   GatewayClientRequestTimeoutError,
   type GatewayClientOptions,
 } from "../../../../packages/gateway-client/src/index.js";
+import { createDeferred } from "../../../helpers/promise.js";
 
 type RequestFrame = {
   id: string;
@@ -18,31 +20,8 @@ type RequestFrame = {
 const clients: GatewayClient[] = [];
 let server: WebSocketServer | undefined;
 
-function rawDataToString(data: RawData): string {
-  if (Array.isArray(data)) {
-    return Buffer.concat(data).toString("utf8");
-  }
-  return Buffer.isBuffer(data)
-    ? data.toString("utf8")
-    : Buffer.from(new Uint8Array(data)).toString("utf8");
-}
-
 function parseRequest(data: RawData): RequestFrame {
   return JSON.parse(rawDataToString(data)) as RequestFrame;
-}
-
-function createDeferred<T>(): {
-  promise: Promise<T>;
-  reject: (reason?: unknown) => void;
-  resolve: (value: T) => void;
-} {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((onResolve, onReject) => {
-    resolve = onResolve;
-    reject = onReject;
-  });
-  return { promise, reject, resolve };
 }
 
 function enableFakeTimeAfterSocketEstablishment(): void {
@@ -129,7 +108,7 @@ async function connectWithFakeTime(params: {
   tickIntervalMs: number;
 }): Promise<{ client: GatewayClient; socket: WebSocket }> {
   const socketReady = createDeferred<WebSocket>();
-  const helloReady = createDeferred<void>();
+  const helloReady = createDeferred();
   const url = await listen((socket, request) => {
     if (request.method === "connect") {
       sendHello(socket, request.id, params.tickIntervalMs);
@@ -163,6 +142,7 @@ afterEach(async () => {
     client.stop();
   }
   vi.useRealTimers();
+  vi.restoreAllMocks();
   if (server) {
     for (const socket of server.clients) {
       socket.terminate();
@@ -176,7 +156,7 @@ afterEach(async () => {
 
 describe("GatewayClient transport defaults", () => {
   it("uses a 30 second default request timeout", async () => {
-    const requestReady = createDeferred<void>();
+    const requestReady = createDeferred();
     const { client } = await connectWithFakeTime({
       tickIntervalMs: 60_000,
       onRequest: (_socket, request) => {
@@ -250,7 +230,8 @@ describe("GatewayClient transport defaults", () => {
     });
   });
 
-  it("reconnects after 1/2/4 second delays capped at 30 seconds", async () => {
+  it("jitters exponential reconnect delays within the 30 second cap", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
     const sockets: WebSocket[] = [];
     const closeEvents: Array<{ code: number; reason: string }> = [];
     const firstSocket = createDeferred<WebSocket>();
@@ -262,7 +243,7 @@ describe("GatewayClient transport defaults", () => {
         firstSocket.resolve(socket);
         return;
       }
-      waitForImmediate().then(() => socket.close(1012, "retry"));
+      void waitForImmediate().then(() => socket.close(1012, "retry"));
     });
     const client = new GatewayClient({
       url,
@@ -275,7 +256,8 @@ describe("GatewayClient transport defaults", () => {
     await flushSocketIo();
     initialSocket.close(1012, "retry");
 
-    const expectedDelays = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+    // A midpoint draw observes jitter, including its shifted interval at the cap.
+    const expectedDelays = [1_100, 2_200, 4_400, 8_800, 17_600, 27_500, 27_500];
     for (const [index, delayMs] of expectedDelays.entries()) {
       await waitForCondition(() => closeEvents.length >= index + 1, `close event ${index + 1}`);
       const connectionCount = sockets.length;
@@ -291,7 +273,6 @@ describe("GatewayClient transport defaults", () => {
       );
     }
 
-    expect(closeEvents).toHaveLength(expectedDelays.length);
     expect(closeEvents).toEqual(expectedDelays.map(() => ({ code: 1012, reason: "retry" })));
   });
 

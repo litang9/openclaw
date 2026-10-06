@@ -1,4 +1,4 @@
-// Resolves auth profile settings that agent runner forwards to providers.
+import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import {
   resolveProviderIdForAuth,
   type ProviderAuthAliasLookupParams,
@@ -15,18 +15,19 @@ export function resolveProviderScopedAuthProfile(params: {
   workspaceDir?: ProviderAuthAliasLookupParams["workspaceDir"];
 }): { authProfileId?: string; authProfileIdSource?: "auto" | "user" } {
   const aliasParams = { config: params.config, workspaceDir: params.workspaceDir };
-  const authProfileId =
+  const providerId = normalizeProviderId(params.provider);
+  const primaryProviderId = normalizeProviderId(params.primaryProvider);
+  const sharesAuthScope =
+    (providerId !== "" && providerId === primaryProviderId) ||
     resolveProviderIdForAuth(params.provider, aliasParams) ===
-    resolveProviderIdForAuth(params.primaryProvider, aliasParams)
-      ? params.authProfileId
-      : undefined;
+      resolveProviderIdForAuth(params.primaryProvider, aliasParams);
+  const authProfileId = sharesAuthScope ? params.authProfileId : undefined;
   return {
     authProfileId,
     authProfileIdSource: authProfileId ? params.authProfileIdSource : undefined,
   };
 }
 
-/** Resolves the auth profile override for a queued follow-up run. */
 export function resolveRunAuthProfile(
   run: FollowupRun["run"],
   provider: string,

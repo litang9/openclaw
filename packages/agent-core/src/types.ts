@@ -10,7 +10,6 @@ import type {
   Tool,
   ToolResultMessage,
 } from "@openclaw/llm-core";
-// Agent Core type module defines shared TypeScript contracts.
 import type { Static, TSchema } from "typebox";
 
 /**
@@ -27,8 +26,8 @@ export type StreamFn = LlmStreamFn;
 /**
  * Configuration for how tool calls from a single assistant message are executed.
  *
- * - "sequential": each tool call is prepared, executed, and finalized before the next one starts.
- * - "parallel": tool calls are prepared sequentially, then allowed tools execute concurrently.
+ * - "sequential": prepare, execute, and finalize each call before the next; steering can skip the tail after one call starts.
+ * - "parallel": prepare calls sequentially, then execute allowed tools concurrently without steering skips.
  *   `tool_execution_end` is emitted in tool completion order after each tool is finalized,
  *   while tool-result message artifacts are emitted later in assistant source order.
  */
@@ -56,12 +55,18 @@ export interface BeforeToolCallResult {
   reason?: string;
 }
 
-/** A validated call participating in an internal whole-batch admission check. */
+/** A call participating in an internal whole-batch admission check. */
 export interface InternalToolBatchCall {
   toolCall: AgentToolCall;
+  /** Validated arguments, or the raw arguments when validation rejected the call. */
   args: unknown;
   /** Resolved tool identity for OpenClaw-owned argument canonicalization. */
   tool?: AgentTool;
+  /**
+   * Error result for a call rejected by argument validation. It never executes;
+   * the batch lifecycle commits it at its assistant-order launch position.
+   */
+  validationFailure?: AgentToolResult<unknown>;
 }
 
 /** Typed core signal used to recover once from a critical tool loop. */
@@ -75,6 +80,13 @@ export interface ToolLoopIntervention {
   reason: string;
 }
 
+/** Bucketed feedback for an admitted call, not a veto or recovery attempt. */
+export interface ToolLoopWarning {
+  kind: "tool-loop-warning";
+  toolCallId: string;
+  count: number;
+}
+
 /** Context for OpenClaw-owned whole-batch tool admission. */
 export interface InternalBeforeToolBatchContext {
   assistantMessage: AssistantMessage;
@@ -83,16 +95,16 @@ export interface InternalBeforeToolBatchContext {
 }
 
 /** Result of OpenClaw-owned whole-batch tool admission. */
-export interface InternalBeforeToolBatchResult {
-  intervention?: ToolLoopIntervention;
-}
+export type InternalBeforeToolBatchResult =
+  | { intervention: ToolLoopIntervention; warnings?: never }
+  | { intervention?: never; warnings?: ToolLoopWarning[] };
 
 export interface DeferredToolCallContext {
-  /** The assistant message that requested the deferred tool call. */
+  /** The assistant message that requested the tool call. */
   assistantMessage: AssistantMessage;
-  /** The raw tool call block whose authorized tool definition is deferred. */
+  /** The raw tool call block from `assistantMessage.content`. */
   toolCall: AgentToolCall;
-  /** Current agent context before the deferred tool is hydrated. */
+  /** Current agent context when the hook runs. */
   context: AgentContext;
 }
 
@@ -120,31 +132,17 @@ export interface AfterToolCallResult {
 }
 
 /** Context passed to `beforeToolCall`. */
-export interface BeforeToolCallContext {
-  /** The assistant message that requested the tool call. */
-  assistantMessage: AssistantMessage;
-  /** The raw tool call block from `assistantMessage.content`. */
-  toolCall: AgentToolCall;
+export interface BeforeToolCallContext extends DeferredToolCallContext {
   /** Validated tool arguments for the target tool schema. */
   args: unknown;
-  /** Current agent context at the time the tool call is prepared. */
-  context: AgentContext;
 }
 
 /** Context passed to `afterToolCall`. */
-export interface AfterToolCallContext {
-  /** The assistant message that requested the tool call. */
-  assistantMessage: AssistantMessage;
-  /** The raw tool call block from `assistantMessage.content`. */
-  toolCall: AgentToolCall;
-  /** Validated tool arguments for the target tool schema. */
-  args: unknown;
+export interface AfterToolCallContext extends BeforeToolCallContext {
   /** The executed tool result before unknown `afterToolCall` overrides are applied. */
   result: AgentToolResult<unknown>;
   /** Whether the executed tool result is currently treated as an error. */
   isError: boolean;
-  /** Current agent context at the time the tool call is finalized. */
-  context: AgentContext;
 }
 
 /**
@@ -154,23 +152,11 @@ export interface AfterToolCallContext {
  * execution. `args` contains validated arguments when execution reached the
  * prepared state, otherwise the raw model arguments.
  */
-export interface AfterToolOutcomeContext {
-  /** The assistant message that requested the tool call. */
-  assistantMessage: AssistantMessage;
-  /** The tool call whose final result is being emitted. */
-  toolCall: AgentToolCall;
-  /** Validated arguments when available, otherwise the raw model arguments. */
-  args: unknown;
-  /** Final result after any executed-only `afterToolCall` override. */
-  result: AgentToolResult<unknown>;
-  /** Whether the finalized result is currently treated as an error. */
-  isError: boolean;
+export interface AfterToolOutcomeContext extends AfterToolCallContext {
   /** Whether the tool implementation started executing. */
   executionStarted: boolean;
   /** Typed pre-execution failure provenance when available. */
   errorKind?: "argument-validation";
-  /** Current agent context at the time the tool outcome is finalized. */
-  context: AgentContext;
 }
 
 /** Context passed to `shouldStopAfterTurn`. */
@@ -186,7 +172,15 @@ export interface ShouldStopAfterTurnContext {
 }
 
 /** Replacement runtime state used by the agent loop before starting another provider request. */
+export type AgentLoopContinuationUpdate = Pick<AgentContext, "systemPrompt" | "tools">;
+
 export interface AgentLoopTurnUpdate {
+  /** Commit accepted steering and settle this invocation without another model request. */
+  stop?: boolean;
+  /** Prepare only an admitted continuation, after its queued input has been emitted. */
+  prepareContinuation?: (
+    context: AgentContext,
+  ) => AgentLoopContinuationUpdate | Promise<AgentLoopContinuationUpdate>;
   /** Context for the next provider request. */
   context?: AgentContext;
   /** Model for the next provider request. */
@@ -271,7 +265,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
    * Called after each turn fully completes and `turn_end` has been emitted.
    *
    * If it returns true, the loop emits `agent_end` and exits before polling steering or follow-up queues,
-   * without starting another LLM call. The current assistant response and any tool executions finish normally.
+   * without starting another LLM call. Steering already drained at a tool checkpoint takes precedence,
+   * so this hook is deferred until that steering turn completes.
    *
    * Use this to request a graceful stop after the current turn, e.g. before context gets too full.
    *
@@ -291,13 +286,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
   /**
    * Returns steering messages to inject into the conversation mid-run.
    *
-   * Called after the current assistant turn finishes executing its tool calls, unless `shouldStopAfterTurn` exits first.
-   * If messages are returned, they are added to the context before the next LLM call.
-   * Tool calls from the current assistant message are not skipped.
+   * After a call from the assistant message actually starts, sequential execution
+   * checks before each later call, including again after asynchronous preparation.
+   * Streamed batches share that started state. Parallel batches never steering-skip.
+   * Both modes check after a batch settles, before stop hooks. Drained messages
+   * follow tool results before the next LLM call; already-running calls continue.
+   *
+   * Once a check returns messages, the loop carries that exact result to the
+   * next turn without polling again. This preserves queue drain ordering.
    *
    * Use this for "steering" the agent while it's working.
    *
-   * Contract: must not throw or reject. Return [] when no steering messages are available.
+   * Contract: must not throw or reject. Resolve to [] when no steering messages are available.
    */
   getSteeringMessages?: () => Promise<AgentMessage[]>;
 
@@ -314,10 +314,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
    */
   getFollowUpMessages?: () => Promise<AgentMessage[]>;
 
+  /** Consumes the cancellation fact for a previously drained queue message. */
+  consumeQueuedMessageCancellation?: (message: AgentMessage) => boolean;
+
   /**
    * Tool execution mode.
-   * - "sequential": execute tool calls one by one
+   * - "sequential": execute calls one by one; after one starts, steering can skip later calls
    * - "parallel": preflight tool calls sequentially, then execute allowed tools concurrently;
+   *   steering is checked after settlement without skipping prepared calls;
    *   emit `tool_execution_end` in tool completion order after each tool is finalized,
    *   then emit tool-result message artifacts later in assistant source order
    *
@@ -341,6 +345,16 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
     context: InternalBeforeToolBatchContext,
     signal?: AbortSignal,
   ) => Promise<InternalBeforeToolBatchResult | undefined>;
+
+  /**
+   * @internal OpenClaw-owned turn completion. Runs once after every tool call from one
+   * assistant message has settled; returning true ends the turn even when not every
+   * result asked to terminate. Not a plugin or session SDK hook.
+   */
+  completesToolTurn?: (context: {
+    message: AssistantMessage;
+    toolResults: ToolResultMessage[];
+  }) => boolean;
 
   /** @internal Preserves the one-shot recovery budget across Agent.continue() retries. */
   toolLoopRecoveryState?: ToolLoopRecoveryState;
@@ -420,6 +434,8 @@ export interface CustomMessage<T = unknown> {
   content: string | (TextContent | ImageContent)[];
   /** Whether UI surfaces should display this message. */
   display: boolean;
+  /** Keep display-only application activity out of future model context. */
+  excludeFromContext?: boolean;
   /** Optional application-specific metadata. */
   details?: T;
   /** Millisecond timestamp for transcript ordering. */
@@ -621,10 +637,12 @@ export type AgentEvent =
   | {
       type: "tool_execution_end";
       toolCallId: string;
+      /** Issuing assistant response identity; provider call ids are only unique within one response. */
+      assistantTurnId?: string;
       toolName: string;
       result: unknown;
       isError: boolean;
-      /** False when resolution, argument preparation, validation, or policy blocked execution. */
+      /** False when resolution, preparation, validation, policy, or queued steering prevented execution. */
       executionStarted?: boolean;
       /** Typed pre-execution failure provenance for safe downstream diagnostics. */
       errorKind?: "argument-validation";
