@@ -1,0 +1,56 @@
+name: PR 104322 real SDK transport proof
+
+on:
+  workflow_dispatch:
+
+# The candidate receives no repository token, secrets, or persisted git credentials.
+permissions: {}
+
+jobs:
+  transport-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install pinned Node runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "24.21.0"
+          token: ""
+
+      - name: Fetch public proof and exact reviewed candidate
+        env:
+          PROOF_WORKFLOW_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PROOF_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git init --quiet proof
+          git -C proof fetch --quiet --depth=1 https://github.com/litang9/openclaw.git "$PROOF_WORKFLOW_SHA"
+          git -C proof checkout --quiet --detach FETCH_HEAD
+          git init --quiet candidate
+          git -C candidate fetch --quiet --depth=1 https://github.com/openclaw/openclaw.git 70b58575edd3edc60dde7ff25141f36be29bb77f
+          git -C candidate checkout --quiet --detach FETCH_HEAD
+          test "$(git -C candidate rev-parse HEAD)" = 70b58575edd3edc60dde7ff25141f36be29bb77f
+          git -C candidate diff --exit-code
+          cp proof/transport-proof.test.ts candidate/extensions/feishu/src/pr104322.transport-proof.test.ts
+          printf 'PROOF_SOURCE_HEAD=%s\n' "$(git -C candidate rev-parse HEAD)"
+          sha256sum proof/transport-proof.test.ts
+
+      - name: Install frozen candidate dependencies without lifecycle scripts
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          env -i PATH="$PATH" CI=1 COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+            corepack pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Exercise current production owner and real SDK HTTP fault recovery
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" CI=1 COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+            OPENCLAW_PROOF_SOURCE_SHA=70b58575edd3edc60dde7ff25141f36be29bb77f \
+            corepack pnpm test extensions/feishu/src/pr104322.transport-proof.test.ts --maxWorkers=1
+          git diff --exit-code
