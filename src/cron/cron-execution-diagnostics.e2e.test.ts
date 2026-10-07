@@ -1,4 +1,4 @@
-import { createServer, type Server, type AddressInfo } from "node:net";
+import { createServer, type AddressInfo, type Server } from "node:net";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { FailoverError } from "../agents/failover-error.js";
 import {
@@ -8,9 +8,10 @@ import {
 } from "../agents/run-termination.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { createAgentRunStaleLifecycleError } from "../infra/agent-lifecycle-error.js";
-import { resetTaskRegistryForTests } from "../tasks/task-runtime.test-helpers.js";
+import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
+  dispatchCronDeliveryMock,
   loadRunCronIsolatedAgentTurn,
   mockRunCronFallbackPassthrough,
   resetRunCronIsolatedAgentTurnHarness,
@@ -19,10 +20,10 @@ import {
   runEmbeddedAgentMock,
   runWithModelFallbackMock,
 } from "./isolated-agent/run.test-harness.js";
+import { readCronRunHistoryPageForTests } from "./run-history.test-support.js";
 import { CronService, type CronEvent } from "./service.js";
 import { createNoopLogger } from "./service.test-harness.js";
 import { cronStoreKey } from "./store/key.js";
-import { readCronTaskRunHistoryPage } from "./task-run-history.js";
 
 vi.doUnmock("./isolated-agent/model-preflight.runtime.js");
 
@@ -88,10 +89,11 @@ async function runPersistedDiagnosticCase(params: {
   return await withOpenClawTestState(
     { layout: "state-only", prefix: "openclaw-cron-execution-diagnostics-" },
     async (state) => {
-      resetTaskRegistryForTests();
       const events: CronEvent[] = [];
       const storePath = state.path("cron", "jobs.json");
       const cron = new CronService({
+        scheduler: createTestGatewayScheduler(),
+        nowMs: () => Date.now(),
         storePath,
         cronEnabled: true,
         cronConfig: { triggers: { enabled: true } },
@@ -127,7 +129,7 @@ async function runPersistedDiagnosticCase(params: {
         const finished = events.find(
           (event) => event.action === "finished" && event.jobId === job.id,
         );
-        const history = readCronTaskRunHistoryPage({
+        const history = readCronRunHistoryPageForTests({
           storeKey: cronStoreKey(storePath),
           jobId: job.id,
           limit: 1,
@@ -138,16 +140,16 @@ async function runPersistedDiagnosticCase(params: {
           finished: finished!,
           history: history!,
           lastError: cron.getJob(job.id)?.state.lastError,
+          lastErrorReason: cron.getJob(job.id)?.state.lastErrorReason,
         };
       } finally {
         cron.stop();
-        resetTaskRegistryForTests({ persist: false });
       }
     },
   );
 }
 
-describe.sequential("cron execution diagnostics", () => {
+describe("cron execution diagnostics", { concurrent: false }, () => {
   const servers: Server[] = [];
 
   beforeEach(() => {
@@ -226,8 +228,7 @@ describe.sequential("cron execution diagnostics", () => {
   });
 
   it("persists provider failures without internal class names", async () => {
-    const message =
-      "The selected model was not found by the provider. Check the model id or choose a different model.";
+    const message = "Saved selection requires an update.";
     const modelRef = { provider: "openai", model: "not-a-real-model" };
     resolveConfiguredModelRefMock.mockReturnValue(modelRef);
     resolveAllowedModelRefMock.mockReturnValue({ ref: modelRef });
@@ -236,11 +237,10 @@ describe.sequential("cron execution diagnostics", () => {
         reason: "model_not_found",
         provider: modelRef.provider,
         model: modelRef.model,
-        code: "MODEL_NOT_FOUND",
       }),
     );
 
-    const { finished, history, lastError } = await runPersistedDiagnosticCase({
+    const { finished, history, lastError, lastErrorReason } = await runPersistedDiagnosticCase({
       cfg: configFor(modelRef),
       modelRef,
       name: "missing provider model",
@@ -251,12 +251,13 @@ describe.sequential("cron execution diagnostics", () => {
         status: "error",
         provider: modelRef.provider,
         model: modelRef.model,
-        error: `${message} | MODEL_NOT_FOUND`,
+        error: message,
         diagnostics: { summary: message },
       });
       expect(outcome.error).not.toContain("FailoverError");
     }
-    expect(lastError).toBe(`${message} | MODEL_NOT_FOUND`);
+    expect(lastError).toBe(message);
+    expect(lastErrorReason).toBe("model_not_found");
     expect(history.errorReason).toBe("model_not_found");
   });
 
@@ -326,6 +327,99 @@ describe.sequential("cron execution diagnostics", () => {
               source: "tool",
               severity: "error",
               message: "SYSTEM_RUN_DENIED: approval required",
+            }),
+          ]),
+        },
+      });
+    }
+  });
+
+  it("persists an unresolved exec warning when the scheduled agent recovers with a reply", async () => {
+    const modelRef = { provider: "openai", model: "gpt-5.4" };
+    resolveConfiguredModelRefMock.mockReturnValue(modelRef);
+    mockRunCronFallbackPassthrough();
+    runEmbeddedAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "RESULT: the command did not run" }],
+      meta: {
+        agentMeta: {},
+        toolSummary: {
+          calls: 1,
+          tools: ["exec"],
+          failures: 1,
+          unresolvedError: { toolName: "exec" },
+        },
+      },
+    });
+
+    const { finished, history, lastError } = await runPersistedDiagnosticCase({
+      cfg: configFor(modelRef),
+      modelRef,
+      name: "invalid exec arguments",
+    });
+
+    expect(lastError).toBeUndefined();
+    for (const outcome of [finished, history]) {
+      expect(outcome).toMatchObject({
+        status: "ok",
+        diagnostics: {
+          summary: "exec tool failed",
+          entries: [
+            expect.objectContaining({
+              source: "exec",
+              severity: "warn",
+              message: "exec tool failed",
+              toolName: "exec",
+            }),
+          ],
+        },
+      });
+    }
+  });
+
+  it("persists and emits terminal tool detail while keeping the payload generic", async () => {
+    const modelRef = { provider: "openai", model: "gpt-5.4" };
+    resolveConfiguredModelRefMock.mockReturnValue(modelRef);
+    mockRunCronFallbackPassthrough();
+    runEmbeddedAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "⚠️ Exec failed", isError: true, toolName: "exec" }],
+      meta: {
+        agentMeta: {},
+        terminalToolFailure: {
+          source: "tool",
+          toolName: "exec",
+          code: "UNKNOWN_TOOL_ID",
+        },
+      },
+    });
+
+    const { finished, history } = await runPersistedDiagnosticCase({
+      cfg: configFor(modelRef),
+      modelRef,
+      name: "unknown tool id",
+    });
+
+    expect(dispatchCronDeliveryMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deliveryPayloads: [{ text: "cron isolated run returned an error payload", isError: true }],
+        outputText: "cron isolated run returned an error payload",
+        summary: "Code Mode could not resolve a configured MCP tool.",
+      }),
+    );
+
+    for (const outcome of [finished, history]) {
+      expect(outcome).toMatchObject({
+        status: "error",
+        provider: "openai",
+        model: "gpt-5.4",
+        summary: "Code Mode could not resolve a configured MCP tool.",
+        diagnostics: {
+          summary: "Code Mode could not resolve a configured MCP tool.",
+          entries: expect.arrayContaining([
+            expect.objectContaining({
+              source: "tool",
+              severity: "error",
+              message: "Code Mode could not resolve a configured MCP tool.",
+              toolName: "exec",
             }),
           ]),
         },

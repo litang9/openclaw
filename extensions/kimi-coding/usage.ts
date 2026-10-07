@@ -42,14 +42,14 @@ type KimiUsageResponse = {
 };
 
 const DEFAULT_KIMI_USAGE_BASE_URL = "https://api.kimi.com/coding/v1";
-const KIMI_MANAGED_USAGE_ORIGIN = "https://api.kimi.com";
+const KIMI_MANAGED_USAGE_ORIGINS = new Set(["https://api.kimi.com", "https://api.kimi.ai"]);
 const KIMI_MANAGED_USAGE_PATHS = new Set(["/coding", "/coding/v1"]);
 
 function toNumber(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }
-  if (typeof value === "string") {
+  if (typeof value === "string" && value.trim()) {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : undefined;
   }
@@ -109,6 +109,30 @@ function parseKimiUsageWindows(payload: unknown): UsageWindow[] {
     return [];
   }
 
+  // The managed endpoint now reports ratios; older API-key responses used
+  // absolute usage/limits rows. Keep both observed endpoint contracts bounded.
+  if (isRecord(payload) && isRecord(payload.usages)) {
+    const usages = payload.usages;
+    return (["5h", "7d"] as const).flatMap((label) => {
+      const row = usages[`limit_${label}`];
+      if (!isRecord(row)) {
+        return [];
+      }
+      const ratio = toNumber(row.used_ratio);
+      if (ratio === undefined) {
+        return [];
+      }
+      const resetAt = typeof row.reset_time === "string" ? Date.parse(row.reset_time) : NaN;
+      return [
+        {
+          label,
+          usedPercent: Math.round(clampPercent(ratio * 100) * 100) / 100,
+          ...(Number.isFinite(resetAt) ? { resetAt } : {}),
+        },
+      ];
+    });
+  }
+
   const windows: UsageWindow[] = [];
   const sevenDay = usagePercent(data.usage);
   if (sevenDay !== undefined) {
@@ -136,10 +160,16 @@ export async function fetchKimiUsage(
   fetchFn: typeof fetch,
   options?: { baseUrl?: string },
 ): Promise<ProviderUsageSnapshot> {
+  const baseUrl = resolveManagedKimiUsageBaseUrl([normalizeKimiUsageBaseUrl(options?.baseUrl)]);
+  if (!baseUrl) {
+    return buildUsageErrorSnapshot("kimi", "Unsupported usage endpoint");
+  }
   const res = await fetchJson(
-    `${normalizeKimiUsageBaseUrl(options?.baseUrl)}/usages`,
+    `${baseUrl}/usages`,
     {
       method: "GET",
+      // A managed endpoint must never forward its bearer to a redirect destination.
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         Accept: "application/json",
@@ -165,10 +195,14 @@ export async function fetchKimiUsage(
     return buildUsageErrorSnapshot("kimi", "Malformed usage response");
   }
 
+  const windows = parseKimiUsageWindows(payload);
+  if (windows.length === 0) {
+    return buildUsageErrorSnapshot("kimi", "Malformed usage response");
+  }
   return {
     provider: "kimi",
     displayName: PROVIDER_LABELS.kimi,
-    windows: parseKimiUsageWindows(payload),
+    windows,
   };
 }
 
@@ -187,8 +221,29 @@ export function isManagedKimiUsageBaseUrl(baseUrl?: string): boolean {
   try {
     const url = new URL(normalizeKimiUsageBaseUrl(baseUrl));
     const pathname = url.pathname.replace(/\/+$/, "") || "/";
-    return url.origin === KIMI_MANAGED_USAGE_ORIGIN && KIMI_MANAGED_USAGE_PATHS.has(pathname);
+    return (
+      KIMI_MANAGED_USAGE_ORIGINS.has(url.origin) &&
+      KIMI_MANAGED_USAGE_PATHS.has(pathname) &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+    );
   } catch {
     return false;
   }
+}
+
+/** Provider-level credentials are safe only when every effective model shares one managed route. */
+export function resolveManagedKimiUsageBaseUrl(baseUrls?: readonly string[]): string | undefined {
+  if (
+    !baseUrls?.length ||
+    baseUrls.some((baseUrl) => !baseUrl.trim() || !isManagedKimiUsageBaseUrl(baseUrl))
+  ) {
+    return undefined;
+  }
+  const normalized = new Set(
+    baseUrls.map((baseUrl) => new URL(normalizeKimiUsageBaseUrl(baseUrl)).href.replace(/\/+$/, "")),
+  );
+  return normalized.size === 1 ? normalized.values().next().value : undefined;
 }

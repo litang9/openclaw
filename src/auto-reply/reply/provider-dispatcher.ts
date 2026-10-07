@@ -15,20 +15,20 @@ export type {
 
 /** Dispatch a reply using the buffered block dispatcher path. */
 export const dispatchReplyWithBufferedBlockDispatcherCore: DispatchReplyWithBufferedBlockDispatcher =
-  async (params) => {
-    return await dispatchInboundMessageWithBufferedDispatcher({
+  async (params) =>
+    await dispatchInboundMessageWithBufferedDispatcher({
       ctx: params.ctx,
       cfg: params.cfg,
       dispatcherOptions: params.dispatcherOptions,
       toolsAllow: params.toolsAllow,
       replyResolver: params.replyResolver,
       replyOptions: params.replyOptions,
+      dispatchReplyFromConfig: params.dispatchReplyFromConfig,
     });
-  };
 
 /** Dispatch a reply using the standard dispatcher path. */
-export const dispatchReplyWithDispatcherCore: DispatchReplyWithDispatcher = async (params) => {
-  return await dispatchInboundMessageWithDispatcher({
+export const dispatchReplyWithDispatcherCore: DispatchReplyWithDispatcher = async (params) =>
+  await dispatchInboundMessageWithDispatcher({
     ctx: params.ctx,
     cfg: params.cfg,
     dispatcherOptions: params.dispatcherOptions,
@@ -36,4 +36,3 @@ export const dispatchReplyWithDispatcherCore: DispatchReplyWithDispatcher = asyn
     replyResolver: params.replyResolver,
     replyOptions: params.replyOptions,
   });
-};

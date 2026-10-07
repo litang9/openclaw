@@ -1,8 +1,10 @@
+import { streamSimpleAnthropic } from "@openclaw/ai/internal/anthropic";
+import type { Context, Model } from "openclaw/plugin-sdk/llm";
 import { registerSingleProviderPlugin } from "openclaw/plugin-sdk/plugin-test-runtime";
-// Kimi Coding tests cover index plugin behavior.
-import { createProviderUsageFetch, makeResponse } from "openclaw/plugin-sdk/test-env";
+import { createZeroUsageFixture } from "openclaw/plugin-sdk/test-fixtures";
 import { describe, expect, it } from "vitest";
 import plugin from "./index.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
 
 describe("kimi provider plugin", () => {
   it("normalizes legacy Kimi Code ids to the stable API model id", async () => {
@@ -31,9 +33,12 @@ describe("kimi provider plugin", () => {
     );
   });
 
-  it("uses binary thinking with thinking off by default", async () => {
+  it("uses binary thinking with thinking off by default and repairs replay signatures", async () => {
     const provider = await registerSingleProviderPlugin(plugin);
 
+    expect(provider.buildReplayPolicy?.({ provider: "kimi" })).toEqual({
+      preserveSignatures: false,
+    });
     expect(
       provider.resolveThinkingProfile?.({
         provider: "kimi",
@@ -49,13 +54,68 @@ describe("kimi provider plugin", () => {
     });
   });
 
-  it.each(["k3", "k3-256k"])("exposes %s adaptive thinking levels", async (modelId) => {
+  it.each([
+    ["weekly limit", "You've reached your weekly usage limit.", "rate_limit"],
+    ["weekly window", "You've reached your weekly (7-day) usage limit.", "rate_limit"],
+    ["seven-day limit", "Your seven-day usage limit has been reached.", "rate_limit"],
+    ["7-day limit", "You've reached your 7-day usage limit.", "rate_limit"],
+    [
+      "agent access restriction",
+      "Kimi For Coding is currently only available for Coding Agents such as Kimi CLI, Claude Code, Roo Code, Kilo Code, etc.",
+      undefined,
+    ],
+  ] as const)("classifies the quota signal for %s", async (_name, errorMessage, expected) => {
+    const provider = await registerSingleProviderPlugin(plugin);
+
+    expect(
+      provider.classifyFailoverReason?.({
+        provider: "kimi",
+        status: 403,
+        errorType: "access_terminated_error",
+        errorMessage,
+      }),
+    ).toBe(expected);
+  });
+
+  it.each([" KIMI ", "kimi-code", "kimi-coding"])(
+    "declares and classifies quota exhaustion for provider %s",
+    async (providerId) => {
+      const provider = await registerSingleProviderPlugin(plugin);
+
+      expect(manifest.providers).toContain(providerId.trim().toLowerCase());
+      expect(
+        provider.classifyFailoverReason?.({
+          provider: providerId,
+          status: 403,
+          errorMessage: "Your quota will reset when the current window ends.",
+        }),
+      ).toBe("rate_limit");
+    },
+  );
+
+  it.each([
+    { providerId: "kimi", status: 401 },
+    { providerId: "other-provider", status: 403 },
+    { providerId: undefined, status: 403 },
+  ])("preserves non-quota ownership for $providerId/$status", async ({ providerId, status }) => {
+    const provider = await registerSingleProviderPlugin(plugin);
+
+    expect(
+      provider.classifyFailoverReason?.({
+        provider: providerId,
+        status,
+        errorMessage: "Your quota will reset when the current window ends.",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("exposes adaptive thinking levels for case-insensitive K3 ids", async () => {
     const provider = await registerSingleProviderPlugin(plugin);
 
     expect(
       provider.resolveThinkingProfile?.({
         provider: "kimi",
-        modelId,
+        modelId: "K3-256K",
         reasoning: true,
       } as never),
     ).toEqual({
@@ -74,17 +134,10 @@ describe("kimi provider plugin", () => {
     });
   });
 
-  it("wraps K3 simple completions without changing K2 simple completions", async () => {
+  it("leaves K2 simple completions unchanged", async () => {
     const provider = await registerSingleProviderPlugin(plugin);
     const streamFn = (() => undefined) as never;
 
-    expect(
-      provider.wrapSimpleCompletionStreamFn?.({
-        provider: "kimi",
-        modelId: "k3",
-        streamFn,
-      } as never),
-    ).not.toBe(streamFn);
     expect(
       provider.wrapSimpleCompletionStreamFn?.({
         provider: "kimi",
@@ -94,93 +147,91 @@ describe("kimi provider plugin", () => {
     ).toBe(streamFn);
   });
 
-  it("resolves Kimi usage auth from existing env and config sources", async () => {
-    const provider = await registerSingleProviderPlugin(plugin);
-
-    await expect(
-      provider.resolveUsageAuth?.({
-        config: {} as never,
-        env: { KIMI_API_KEY: "env-kimi-key", KIMICODE_API_KEY: "legacy-kimi-key" },
-        resolveApiKeyFromConfigAndStore: (options?: {
-          providerIds?: string[];
-          envDirect?: Array<string | undefined>;
-        }) => {
-          expect(options?.providerIds).toEqual(["kimi", "kimi-code", "kimi-coding"]);
-          expect(options?.envDirect).toEqual(["env-kimi-key", "legacy-kimi-key"]);
-          return "resolved-kimi-key";
-        },
-      } as never),
-    ).resolves.toEqual({ token: "resolved-kimi-key" });
-  });
-
-  it("skips Kimi usage auth for custom proxy baseUrl", async () => {
-    const provider = await registerSingleProviderPlugin(plugin);
-
-    await expect(
-      provider.resolveUsageAuth?.({
-        config: {
-          models: {
-            providers: {
-              kimi: { baseUrl: "https://proxy.example/kimi/v1/" },
-            },
+  it.each(["wrapStreamFn", "wrapSimpleCompletionStreamFn"] as const)(
+    "resolves per-call K3 thinking through one %s wrapper",
+    async (hook) => {
+      const provider = await registerSingleProviderPlugin(plugin);
+      const model: Model = {
+        provider: "kimi",
+        id: "k3",
+        name: "Kimi K3",
+        api:
+          hook === "wrapSimpleCompletionStreamFn"
+            ? "openclaw-provider-simple:synthetic"
+            : "anthropic-messages",
+        baseUrl: "https://api.kimi.com/coding/",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_048_576,
+        maxTokens: 131_072,
+      };
+      const context: Context = {
+        messages: [
+          { role: "user", content: "First turn", timestamp: 0 },
+          {
+            role: "assistant",
+            provider: "kimi",
+            model: "k3",
+            api: "anthropic-messages",
+            content: [{ type: "thinking", thinking: "Retained thought", thinkingSignature: "" }],
+            usage: createZeroUsageFixture(),
+            stopReason: "stop",
+            timestamp: 1,
           },
-        } as never,
-        env: { KIMI_API_KEY: "env-kimi-key" },
-        resolveApiKeyFromConfigAndStore: () => "resolved-kimi-key",
-      } as never),
-    ).resolves.toEqual({ handled: true });
-  });
-
-  it("fetches Kimi usage windows through the provider hook", async () => {
-    const provider = await registerSingleProviderPlugin(plugin);
-    const mockFetch = createProviderUsageFetch(async (url) => {
-      expect(url).toBe("https://api.kimi.com/coding/v1/usages");
-      return makeResponse(200, {
-        usage: { limit: 100, used: 12 },
-        limits: [{ name: "5h", detail: { limit: 50, remaining: 45 } }],
+          { role: "user", content: "Next turn", timestamp: 2 },
+        ],
+      };
+      let payload: unknown;
+      const wrapped = provider[hook]?.({
+        provider: "kimi",
+        modelId: model.id,
+        model,
+        sourceApi: "anthropic-messages",
+        thinkingLevel: "low",
+        streamFn: (runtimeModel, streamContext, options) =>
+          streamSimpleAnthropic(
+            { ...runtimeModel, api: "anthropic-messages" },
+            streamContext,
+            options,
+          ),
       });
-    });
-
-    await expect(
-      provider.fetchUsageSnapshot?.({
-        config: {} as never,
-        env: {},
-        provider: "kimi",
-        token: "kimi-key",
-        timeoutMs: 5000,
-        fetchFn: mockFetch,
-      }),
-    ).resolves.toEqual({
-      provider: "kimi",
-      displayName: "Kimi",
-      windows: [
-        { label: "5h", usedPercent: 10 },
-        { label: "7d", usedPercent: 12 },
-      ],
-    });
-  });
-
-  it("skips usage polling for custom Kimi provider baseUrl", async () => {
-    const provider = await registerSingleProviderPlugin(plugin);
-    const mockFetch = createProviderUsageFetch(async () => makeResponse(200, {}));
-
-    await expect(
-      provider.fetchUsageSnapshot?.({
-        config: {
-          models: {
-            providers: {
-              kimi: { baseUrl: "https://proxy.example/kimi/v1/" },
-            },
+      if (!wrapped) {
+        throw new Error(`Kimi did not register ${hook}`);
+      }
+      for (const reasoning of ["off", "max", undefined, "high"] as const) {
+        const stream = await wrapped(model, context, {
+          apiKey: "synthetic-kimi-key",
+          reasoning,
+          onPayload: (value) => {
+            payload = value;
+            throw new Error("stop before network");
           },
-        } as never,
-        env: {},
-        provider: "kimi",
-        token: "kimi-key",
-        timeoutMs: 5000,
-        fetchFn: mockFetch,
-      }),
-    ).resolves.toBeNull();
-
-    expect(mockFetch).not.toHaveBeenCalled();
-  });
+        });
+        expect(await stream.result()).toMatchObject({ errorMessage: "stop before network" });
+        expect(payload).toMatchObject({
+          thinking:
+            reasoning === "off"
+              ? { type: "disabled" }
+              : { type: "adaptive", display: "summarized" },
+        });
+        expect(payload).not.toHaveProperty("thinking.budget_tokens");
+        if (reasoning === "off") {
+          expect(payload).not.toHaveProperty("output_config.effort");
+        } else {
+          expect(payload).toMatchObject({
+            output_config: { effort: reasoning ?? "low" },
+            messages: expect.arrayContaining([
+              expect.objectContaining({
+                role: "assistant",
+                content: expect.arrayContaining([
+                  { type: "thinking", thinking: "Retained thought", signature: "" },
+                ]),
+              }),
+            ]),
+          });
+        }
+      }
+    },
+  );
 });

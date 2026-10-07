@@ -1,9 +1,11 @@
 ---
+doc-schema-version: 1
 summary: "Metadata-only activity history plus durable run identity and decision receipts"
 read_when:
   - You need a durable record of what the Gateway did without storing content
   - You are deciding whether to enable message lifecycle auditing
   - You need to explain what audit records do and do not prove
+  - You are changing or reviewing execution identity, admission provenance, or decision receipts
 title: "Audit history"
 ---
 
@@ -43,29 +45,47 @@ platform-send start use a lazy progress companion, while terminal message rows
 remain in the activity ledger. Run inspection merges both sources directly;
 neither is copied into the generic decision-fact table.
 
+Scheduled runs are an owner-native source too. After exact run admission, a lazy
+lifecycle metadata table binds the admitted context and execution ids to the
+canonical `cron_run_receipts` row. Inspection joins that metadata to the receipt
+directly and preserves its recorded status. New task and flow lifecycle binding
+writes and inspection joins are retired, but their existing tables and rows are
+not dropped or migrated. This removal leaves the database schemas unchanged;
+see the [versioning contract](/reference/database-schemas/versioning).
+Independent audit events and decision facts retain their existing retention
+policies; they are not reconstructed from retained Task or TaskFlow rows. A
+`runId` alone never joins an owner row to an execution. Missing, deleted, corrupt, or
+mismatched bindings remain unknown or absent; they never change execution
+behavior and are never copied into `execution_decision_facts`.
+
 ## Run identity inspection
 
 Execution identity recording is off by default, including on fresh installs
-and upgrades. Enable it explicitly, then restart the Gateway:
+and upgrades. Enable it explicitly for newly admitted runs:
 
 ```bash
 openclaw config set logging.audit.executionIdentity true
-openclaw gateway restart
 ```
 
 Collection requires both `logging.audit.enabled` and
 `logging.audit.executionIdentity` to be true. Setting either to `false`
-stops new contexts after restart; no environment-variable alias or silent
+stops new contexts immediately; no environment-variable alias or silent
 migration enables the feature. Retained contexts remain inspectable until
 their 30-day expiry.
+
+Audit settings apply without restarting the Gateway. Changes affect subsequent
+events and admissions; accepted writes still drain through the same queue, and
+previously admitted identity contexts remain immutable. Enabling collection
+does not backfill earlier activity or add identity to an already admitted run.
 
 After session work admission succeeds, OpenClaw validates and freezes
 one bounded identity envelope, immediately offers it to the existing audit
 writer queue, and continues the run without waiting for writer readiness,
 SQLite, or persistence. The queue drain initializes schema and HMAC-key state,
 pseudonymizes raw references, constructs the immutable context, validates its
-canonical bytes, and persists it through the process-owned shared-state
-connection. An accepted envelope can therefore be temporarily unavailable to
+canonical bytes, and persists it through the existing shared-state worker.
+The process-owned FIFO retains each accepted item until its worker attempt
+settles. An accepted envelope can therefore be temporarily unavailable to
 inspection while queued work finishes.
 
 Persistence remains best-effort. Queue saturation, storage failure, shutdown
@@ -113,7 +133,30 @@ If the private parent token was unavailable, the child remains inspectable but
 the missing parent context, execution, and run evidence is explicit. ACP spawn
 itself is observable. Actions performed wholly inside an external ACP runtime
 without a callback are reported as unsupported evidence, never inferred from
-task or transcript text.
+task or transcript text. After admission, the ACP lifecycle owner records that
+receipt when the prompt is submitted, using the exact admitted execution token.
+It does not claim that a native side effect occurred; adapter authors must add
+an authoritative native-action callback to provide stronger evidence.
+
+Registered plugin runtime calls add bounded facts only after exact run
+admission. A `before_tool_call` hook records its own allow or block as an
+enforced plugin gate; fail-closed hook errors are denials, while a configured
+fail-open error remains unknown. Separate owner-native approval rows remain the
+authority when a hook requests approval.
+
+Plugin-owned node actions distinguish the Gateway gate from the action result.
+Pairing, live connection, command capability, plugin policy, and active
+authority checks are enforced. A node-reported success is attribution-only. If
+the plugin policy returns without calling the supplied node callback, the
+action is unknown with `node.action_callback` missing; OpenClaw does not infer a
+send from the plugin result.
+
+An attached worker records its current credential, bundle/version/features,
+owner epoch, and turn-claim admission as one enforced gate. The existing
+placement and worker-operation rows stay authoritative; their hashes,
+credentials, tokens, environment ids, and session ids are not copied into the
+generic receipt. Admission success proves only that the worker may connect, not
+that a later worker action succeeded.
 
 The foundation records direct local CLI ingress, Gateway boot-system ingress,
 and admitted channel participants at their authoritative producers. For a
@@ -137,6 +180,15 @@ this boundary. A run becomes
 `attribution-only` only when an authoritative ingress supplies an invoker fact.
 Neither state means that identity affected an allow or deny decision.
 
+Configured webhook mapping ids identify only the matched ingress source. They
+do not authenticate a person, service, or invoker. Shared hook authentication
+and direct `/hooks/agent` requests therefore remain unattributed unless another
+authoritative principal producer exists. A mapping transform that suppresses a
+request before admission returns its normal HTTP response but creates no run,
+execution identity, task, or decision receipt. Restart recovery records system
+attribution only after the current durable recovery owner admits the exact
+attempt.
+
 Authenticated Gateway attach records immutable audit facts once. Session
 creation separately reads the live canonical durable profile id so a profile
 link performed after attach cannot orphan session ownership. Ordinary session
@@ -151,6 +203,13 @@ remain unattributed. If authenticated user evidence promises a durable profile
 but profile resolution fails, the invoker is `unknown` rather than guessed from
 headers, device ids, connection ids, or credentials.
 
+Control UI `chat.send`, including queued replies and ACP turns, carries the
+original prepared attach facts into execution admission. Later profile changes
+or reconnects do not rewrite an admitted context. Collected replies retain
+attribution only when every source supplies equivalent attach facts; conflicting
+or missing evidence remains unknown. These facts do not grant sender or tool
+authority and do not create a channel-admission enforcement receipt.
+
 Each present context projects one run-admission receipt. Its outcome
 is `not-applicable`, its policy and grant references are empty, and its reason
 states that no identity-aware policy or grant evaluation was proven. This is
@@ -162,6 +221,36 @@ when every contributing ingress decision was participant-aware and
 outcome-affecting. Wildcard/open policy and explicit attribution-only adapters
 remain `attribution-only`; mixed or missing evidence is `unknown`. Identity and
 the corresponding decision share the existing audit-writer FIFO.
+
+An admitted session-tool access denial queues a private `session` decision
+through that same FIFO. The access owner supplies the reason, policy inputs,
+and missing evidence; the audit writer replaces the target session reference
+with an installation-local HMAC before persistence. The raw session key is not
+retained. A policy denial that changed the outcome is `enforced`, while an
+ownership lookup that cannot supply `session.owner` evidence remains `unknown`.
+Public inspection intentionally renders generic facts as an unverified
+`decision.record`; it does not expose their private reason or target display.
+Calls without the exact admitted execution and its active receipt authority
+create no selector or fact.
+
+Run-bound session tools also queue their owner-returned result after the final
+await and authority recheck. Create, fork, send, patch, reset, archive, restore,
+and delete facts distinguish committed or scheduled work from typed lifecycle
+conflicts and definitive no-ops. These mechanics are `attribution-only`; the
+public generic display remains unverified rather than presenting their private
+reason or target as trusted evidence.
+
+Direct session-sharing methods do not admit model runs,
+so they do not synthesize run selectors. Sharing events preserve a verified
+profile actor when one exists; an expected but unresolved profile is reported
+as unknown, while omitted principal evidence is unattributed. Neither state is
+reconstructed from operator scope, a shared token, session routing, or room
+metadata. Member listings use the same distinction: `addedBy` contains only a
+real principal id, `addedByState: "unknown"` reports explicit principal-less
+evidence, and omission means no actor evidence was supplied. Internal storage
+markers are never returned by the Gateway. Beta-only `local-operator` and
+`operator.admin` member-attribution values are discarded as absent evidence;
+they are not migrated or presented as principals.
 
 For an admitted run with message auditing enabled, run inspection also adapts
 the outbound message lifecycle. It deterministically merges the lazy progress
@@ -176,6 +265,14 @@ The binding remains diagnostic provenance. Only an exact target-validation,
 message-policy, or turn-capability denial that changed the result is
 `enforced`. Portable actions and early suppressions without a durable owner
 record use the generic fact owner on the same audit-writer FIFO.
+
+Cron lifecycle receipts are `attribution-only` and have a `not-applicable`
+decision outcome. They report what the authoritative lifecycle owner retained;
+they do not claim an authorization decision. Cursors are opaque and
+source-specific. Existing numeric cursors and `a:`, `m:`, and `g:` cursors
+remain accepted; cron uses `c:`. Well-formed historical `t:` and `f:` cursors
+return `decision cursor is no longer retained; restart inspection without --cursor`.
+They never alias another source or restart pagination silently.
 
 When the same `runId` has a retained terminal row in `operator_approvals`, the
 inspector also reads its owner-local `operator_approval_execution_identities`
@@ -235,9 +332,16 @@ facts:
   authorization.
 
 The method requires `operator.read`. Requests are closed and select exactly one
-`executionId` or `runId`. Decision pages contain at most 100 receipts;
+`executionId` or `runId`. The public result always contains a required
+`decisionDisplays` array and never contains the private raw receipt array or a
+`decisions` key. The Gateway builds that result from an explicit safe-field
+allowlist; clients do not classify receipt prose. Decision pages contain at
+most 100 displays;
 ambiguous run-discovery pages contain at most 50 candidate executions. Both use
-bounded cursors.
+bounded cursors. Approval and message-delivery selectors are minted from the
+same owner-query row metadata as their projected receipts, use the
+`approval-decision:` and `message-decision:` namespaces, and never derive from
+receipt, resolution, or event identifiers.
 
 Every client with `operator.read` in the same Gateway operator domain may
 receive this retained identity category. This is intentional: the scope already
@@ -266,8 +370,9 @@ See [Audit records](/cli/audit) for the full field reference and query filters.
 
 ## Message lifecycle events
 
-Set [`logging.audit.messages`](/gateway/configuration-reference#audit) to choose what
-is recorded, then restart the Gateway:
+Choose message audit metadata in **Settings → Advanced → Logging**, or set
+[`logging.audit.messages`](/gateway/config-observability#audit). Changes apply
+to subsequent message lifecycle events:
 
 - `off` (default): no message records.
 - `direct`: only messages in direct conversations.
@@ -348,6 +453,9 @@ what was recorded, not as proof of what happened:
 - Writes go through a bounded asynchronous process-owned queue; queue
   saturation, storage failure, or a bounded shutdown timeout can drop records
   and log one operational warning.
+- Shutdown drops waiting metadata at its existing deadline but joins submitted
+  worker operations before releasing the writer. Unknown worker outcomes are
+  not replayed; ordinary native lock contention keeps the existing FIFO retry.
 - Crash-ambiguous outbound sends are recorded as `unknown` rather than
   invented outcomes.
 
@@ -357,8 +465,9 @@ compliance archive; if you need one, use an external system fed by
 
 ## Storage, retention, and migration
 
-Records live in the shared state database (`state/openclaw.sqlite`) and are
-written off the delivery hot path. Queries never return records older than 30
+Records live in the shared state database (`state/openclaw.sqlite`). The existing
+shared-state worker executes audit writes and maintenance off the Gateway thread,
+including schema/key first use and write-triggered pruning. Queries never return records older than 30
 days, and the ledger is capped at 100,000 rows; expired rows are pruned during
 startup, hourly maintenance, and later writes. Each ledger or progress cleanup
 transaction deletes at most 1,024 expired rows and schedules more work until
@@ -368,7 +477,7 @@ Outbound `queued` and `platform-started` records live in the narrowly owned
 `outbound_message_progress` table. The table is created idempotently only on
 the first enabled progress write, remains absent after startup, read-only
 inspection, disabled collection, and terminal-only delivery, and does not
-advance the current state schema version 9. Missing under read-only inspection means no
+advance the state schema version. Missing under read-only inspection means no
 retained progress. It is capped at 200,000 rows with the same 30-day retention.
 Terminal `message.outbound.finished` rows stay in `audit_events`, so a compatible
 older Gateway can open and use the database while ignoring the additive table.
@@ -429,21 +538,83 @@ correlation alone.
 
 ## Querying
 
+The Gateway runs `audit.list` and `audit.activity.list` queries on the shared
+state database worker so SQLite work does not block request handling. Filters
+and the retention cutoff are captured when each read starts; sequence cursors,
+result limits, and the existing `operator.read` permission are unchanged.
+
+`audit.run.inspect` uses the existing read-only worker for identity discovery
+and receipt queries. Missing databases and optional audit tables remain absent;
+inspection does not migrate state or join the audit writer queue. Each request
+captures its selectors, cursors, limits, and retention clock before yielding.
+
 - CLI: [`openclaw audit`](/cli/audit) with filters for agent, session, run,
   kind, status, direction, channel, time bounds, and cursor paging.
 - Gateway RPC: `audit.activity.list` (requires `operator.read`) returns the
   versioned V1 activity event union; the shipped `audit.list` RPC is unchanged
   for older run/tool clients. See
-  [Gateway protocol](/gateway/protocol#audit-ledger-rpc).
+  [Gateway protocol](/gateway/protocol/ledgers#audit-ledger-rpc).
 - Identity RPC: `audit.run.inspect` (requires `operator.read`) accepts one
   `executionId` for exact inspection or one `runId` for bounded discovery. It
-  returns the immutable V1 context plus paged admission, approval,
-  owner-native outbound message, and generic decision receipts for an exact
-  match, or a typed ambiguous candidate page when a run has multiple executions.
+  returns the immutable V1 context plus paged safe displays for admission,
+  approval, owner-native outbound message, and generic decision records for an
+  exact match, or a typed ambiguous candidate page with an empty display array
+  when a run has multiple executions. Raw owner receipts remain private to the
+  aggregation and storage owners.
+
+## Maintainer invariants
+
+Changes to identity producers, storage, and inspection must preserve these
+boundaries alongside the operator behavior above:
+
+- Only byte-identical canonical replay is idempotent. Retries, fallbacks, and
+  recovery reuse the original admission identity.
+- The parent approval row is the sole authorization owner. Its optional identity
+  companion persists identity only for an exact host-validated source-run binding
+  under explicit collection opt-in; disabled and unbound paths leave the table
+  absent. It must not change approval decisions when provenance is missing,
+  deleted, or corrupt. Do not add eager creation, late binding, dual writes,
+  fallback readers, sidecars, or schema-version workarounds. Changes require
+  older-reader open/use and candidate-reopen proof.
+- Invoker evidence is tri-state: tagged principal-bearing input is `present`,
+  tagged principal-less input is `unknown`, and omission alone is `absent`.
+  Validate the closed raw variant before projection or field dropping; reject
+  malformed, mixed, untagged, or extra-field input instead of normalizing it.
+- Generic decision facts require an explicit product-boundary producer and an
+  operator retention opt-in. The 30-day bound does not authorize default
+  collection. Producers use admission's shared `AuditEventWriter` FIFO; never
+  write the generic store directly, create another writer/key, or pseudonymize
+  locally. The writer alone HMAC-projects raw references before persistence.
+- `enforced` receipt coverage is diagnostic, not authority: emit it only when
+  the owner changed the outcome and the exact context/execution/run tuple
+  validates. After awaited work, synchronously revalidate the exact live owner
+  immediately before the sink, with no intervening await. Stale, released,
+  replaced, or throwing authority emits no receipt, not `unknown`. Same-run
+  wrappers compose owner predicates; distinct admitted runs start new predicate
+  roots. Insufficient decision evidence remains `unknown`.
+- Display trust comes from owner-held call-path provenance, never
+  receipt-controlled `source.owner` or prose. Pair every selected owner row or
+  event with its required opaque selector from the same query/page result.
+  Never derive or requery selectors from private receipt, resolution, or event
+  identifiers, or drop corrupt, oversized, or unlinked outcomes.
+- Admission validates a recursively owned, enumerable, accessor-free data
+  snapshot constructed from descriptors before schema checks or ordinary
+  property reads. Inherited properties are absent; accessors never run.
+  Admission may only validate, bound, freeze, and enqueue: no synchronous
+  SQLite, schema, filesystem, HMAC-key, or readiness work. Audit failure never
+  delays or aborts execution.
+- Public Plugin SDK ingress strips private recovery/admission authority,
+  including JavaScript extra and inherited properties.
+- Host-minted participant evidence is redeemed once against the finalized
+  context and exact plugin record/lifecycle epoch. Mixed participants may remove
+  sender-derived authority only; never widen or erase independent tools, grants,
+  routing, or approval authority.
+- Ask before changing reader scope, default-off collection, retained fields,
+  the 30-day cutoff, maintenance/row bounds, or schema/protocol contracts.
 
 ## Related
 
 - [Audit records CLI](/cli/audit)
-- [Configuration reference](/gateway/configuration-reference#audit)
-- [Gateway protocol](/gateway/protocol#audit-ledger-rpc)
+- [Configuration reference](/gateway/config-observability#audit)
+- [Gateway protocol](/gateway/protocol/ledgers#audit-ledger-rpc)
 - [OpenTelemetry](/gateway/opentelemetry)

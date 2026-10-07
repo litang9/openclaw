@@ -40,7 +40,6 @@ async function resolveLiveModel(): Promise<{
   const discovery = await discoverLlamaServer({
     baseUrl: LIVE_URL,
     apiKey: LIVE_KEY,
-    cacheTtlMs: 0,
   });
   if (discovery.kind !== "success") {
     throw new Error(`llama-server discovery failed: ${discovery.kind}`);
@@ -54,7 +53,7 @@ async function resolveLiveModel(): Promise<{
   return {
     model: {
       ...discovered.config,
-      provider: "llama-server",
+      provider: "llama-cpp",
       api: "openai-completions",
       baseUrl: discovery.endpoint.inferenceBaseUrl,
       input: discovered.config.input.filter(
@@ -98,7 +97,7 @@ describeLive("llama-server live", () => {
             ],
           },
           {
-            apiKey: LIVE_KEY || "llama-server-local",
+            apiKey: LIVE_KEY || "llama-cpp-local",
             maxTokens: 64,
           },
         ),
@@ -128,7 +127,7 @@ describeLive("llama-server live", () => {
         ],
       },
       {
-        apiKey: LIVE_KEY || "llama-server-local",
+        apiKey: LIVE_KEY || "llama-cpp-local",
         maxTokens: 64,
         responseFormat: {
           type: "object",
@@ -159,7 +158,7 @@ describeLive("llama-server live", () => {
         ],
       },
       {
-        apiKey: LIVE_KEY || "llama-server-local",
+        apiKey: LIVE_KEY || "llama-cpp-local",
         maxTokens: 4096,
         signal: controller.signal,
       },
@@ -185,7 +184,7 @@ describeLive("llama-server live", () => {
       model,
       { messages: [user], tools: [tool] },
       {
-        apiKey: LIVE_KEY || "llama-server-local",
+        apiKey: LIVE_KEY || "llama-cpp-local",
         maxTokens: 256,
       },
     );
@@ -215,7 +214,7 @@ describeLive("llama-server live", () => {
         tools: [tool],
       },
       {
-        apiKey: LIVE_KEY || "llama-server-local",
+        apiKey: LIVE_KEY || "llama-cpp-local",
         maxTokens: 128,
       },
     );

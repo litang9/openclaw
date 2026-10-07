@@ -7,7 +7,7 @@ import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/s
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ProviderSystemPromptContribution } from "./system-prompt-contribution.js";
 
-const GPT5_MODEL_ID_PATTERN = /(?:^|[/:])gpt-5(?:[.-]|$)/i;
+const GPT5_MODEL_ID_PATTERN = /(?:^|[/:])gpt-[56](?:[.-]|$)/i;
 const OPENAI_FAMILY_GPT5_PROMPT_OVERLAY_PROVIDERS = new Set([
   "codex",
   "codex-cli",
@@ -122,11 +122,10 @@ export function resolveGpt5SystemPromptContribution(params: {
   const mode = resolveGpt5PromptOverlayMode(params.config, params.legacyPluginConfig, {
     providerId: params.providerId,
   });
-  const includeHeartbeatGuidance =
-    params.includeHeartbeatGuidance === true || params.trigger === "heartbeat";
-  const interactionStyle = includeHeartbeatGuidance
-    ? GPT5_FRIENDLY_PROMPT_OVERLAY
-    : GPT5_FRIENDLY_CHAT_PROMPT_OVERLAY;
+  const interactionStyle =
+    params.includeHeartbeatGuidance === true
+      ? GPT5_FRIENDLY_PROMPT_OVERLAY
+      : GPT5_FRIENDLY_CHAT_PROMPT_OVERLAY;
   return {
     stablePrefix: GPT5_BEHAVIOR_CONTRACT,
     sectionOverrides: mode === "friendly" ? { interaction_style: interactionStyle } : {},

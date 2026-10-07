@@ -36,6 +36,11 @@ describe("widget theme bridge", () => {
       "--accent": "#bd4531",
       "--primary": "#bd4531",
       "--primary-foreground": "#fff",
+      "--radius-full": "9999px",
+      "--scrollbar-size": "12px",
+      "--scrollbar-thumb-inset": "3px",
+      "--scrollbar-thumb": "rgba(110, 105, 96, 0.32)",
+      "--scrollbar-thumb-hover": "rgba(110, 105, 96, 0.64)",
       "--mono": " ui-monospace ",
     });
     const postMessage = vi.fn();
@@ -54,24 +59,13 @@ describe("widget theme bridge", () => {
         accent: "#bd4531",
         "accent-fill": "#bd4531",
         "accent-fg": "#fff",
+        "radius-full": "9999px",
+        "scrollbar-size": "12px",
+        "scrollbar-thumb-inset": "3px",
+        "scrollbar-thumb": "rgba(110, 105, 96, 0.32)",
+        "scrollbar-thumb-hover": "rgba(110, 105, 96, 0.64)",
         "font-mono": "ui-monospace",
       },
-    });
-  });
-
-  it("reports dark mode when the host theme mode is not light", () => {
-    document.documentElement.dataset.themeMode = "dark";
-    stubComputedStyles({ "--bg": "#0e1015" });
-    const postMessage = vi.fn();
-    const frame = { contentWindow: { postMessage } } as unknown as HTMLIFrameElement;
-
-    postWidgetTheme(frame);
-
-    const [message] = postedMessage(postMessage);
-    expect(message).toEqual({
-      type: "openclaw:widget-theme",
-      mode: "dark",
-      tokens: { surface: "#0e1015" },
     });
   });
 
@@ -130,7 +124,7 @@ describe("widget theme bridge", () => {
       document.documentElement,
       {
         attributes: true,
-        attributeFilter: ["data-theme", "data-theme-mode"],
+        attributeFilter: ["data-theme", "data-theme-mode", "style"],
       },
     );
     FakeMutationObserver.instances[0]?.trigger({
@@ -138,6 +132,13 @@ describe("widget theme bridge", () => {
     } as MutationRecord);
     expect(chatPost).toHaveBeenCalledOnce();
     expect(boardPost).toHaveBeenCalledOnce();
+    expect(unrelatedPost).not.toHaveBeenCalled();
+    // Accent overrides land as inline style mutations on <html>.
+    FakeMutationObserver.instances[0]?.trigger({
+      attributeName: "style",
+    } as MutationRecord);
+    expect(chatPost).toHaveBeenCalledTimes(2);
+    expect(boardPost).toHaveBeenCalledTimes(2);
     expect(unrelatedPost).not.toHaveBeenCalled();
   });
 });

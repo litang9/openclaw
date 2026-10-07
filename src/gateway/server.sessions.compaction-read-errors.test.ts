@@ -4,40 +4,46 @@ import {
   appendTranscriptMessage,
   upsertSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
+// Install the mocked reader before the Gateway loads its accessor graph.
+import "../config/sessions/session-transcript-stats.js";
 import { rpcReq } from "./test-helpers.js";
 import {
   sessionStoreEntry,
   setupGatewaySessionsTestHarness,
 } from "./test/server-sessions.test-helpers.js";
 
-type LoadTranscriptEvents =
-  (typeof import("../config/sessions/session-accessor.sqlite-read.js"))["loadTranscriptEvents"];
+vi.hoisted(() => {
+  // Earlier Gateway suites may have already loaded the unmocked accessor graph.
+  vi.resetModules();
+});
+
+type ReadTranscriptStatsAsync =
+  (typeof import("../config/sessions/session-transcript-stats.js"))["readTranscriptStatsAsync"];
 
 const transcriptReads = vi.hoisted(() => ({
-  actual: undefined as LoadTranscriptEvents | undefined,
-  load: vi.fn<LoadTranscriptEvents>(),
+  stats: vi.fn<ReadTranscriptStatsAsync>(),
 }));
 
-vi.mock("../config/sessions/session-accessor.sqlite-read.js", async (importOriginal) => {
+vi.mock("../config/sessions/session-transcript-stats.js", async (importOriginal) => {
   const actual =
-    await importOriginal<typeof import("../config/sessions/session-accessor.sqlite-read.js")>();
-  transcriptReads.actual = actual.loadTranscriptEvents;
-  transcriptReads.load.mockImplementation(actual.loadTranscriptEvents);
-  return { ...actual, loadTranscriptEvents: transcriptReads.load };
+    await importOriginal<typeof import("../config/sessions/session-transcript-stats.js")>();
+  return {
+    ...actual,
+    readTranscriptStatsAsync: transcriptReads.stats,
+  };
 });
 
 const { createSessionStoreDir, openClient } = setupGatewaySessionsTestHarness();
 
-function requireTranscriptReader(): LoadTranscriptEvents {
-  if (!transcriptReads.actual) {
-    throw new Error("transcript reader mock was not initialized");
-  }
-  return transcriptReads.actual;
-}
+let realTranscriptStatsReader: ReadTranscriptStatsAsync;
 
-beforeEach(() => {
-  transcriptReads.load.mockReset();
-  transcriptReads.load.mockImplementation(requireTranscriptReader());
+beforeEach(async () => {
+  transcriptReads.stats.mockReset();
+  const actual = await vi.importActual<
+    typeof import("../config/sessions/session-transcript-stats.js")
+  >("../config/sessions/session-transcript-stats.js");
+  realTranscriptStatsReader = actual.readTranscriptStatsAsync;
+  transcriptReads.stats.mockImplementation(realTranscriptStatsReader);
 });
 
 async function seedCompactionSession(params: {
@@ -86,91 +92,102 @@ async function seedCompactionSession(params: {
 const transcriptReadError = () =>
   new Error("SQLITE_IOERR: failed to read session transcript storage");
 
-test("sessions.compact reports initial transcript read failures as unavailable", async () => {
-  const { storePath } = await createSessionStoreDir();
-  await seedCompactionSession({ sessionId: "sess-read-failure", storePath });
-  transcriptReads.load.mockRejectedValueOnce(transcriptReadError());
-
-  const { ws } = await openClient();
-  try {
-    const response = await rpcReq(ws, "sessions.compact", { key: "main" });
-
-    expect(response.ok).toBe(false);
-    expect(response.error).toMatchObject({
-      code: "UNAVAILABLE",
-      message: expect.stringContaining("failed to read session transcript storage"),
-    });
-  } finally {
-    ws.close();
-  }
-});
-
-test("sessions.compact reports model compaction transcript re-read failures as unavailable", async () => {
-  const { storePath } = await createSessionStoreDir();
-  const scope = await seedCompactionSession({
-    sessionId: "sess-model-read-failure",
-    storePath,
-    nativeHarness: true,
+// Background reads must not consume the failure intended for the compaction RPC.
+function failTranscriptStatsForSession(
+  sessionId: string,
+  options?: { succeedFirstWith: Awaited<ReturnType<ReadTranscriptStatsAsync>> },
+): void {
+  let sessionReads = 0;
+  transcriptReads.stats.mockImplementation(async (scope) => {
+    if (scope.sessionId !== sessionId) {
+      return realTranscriptStatsReader(scope);
+    }
+    sessionReads += 1;
+    if (options && sessionReads === 1) {
+      return options.succeedFirstWith;
+    }
+    throw transcriptReadError();
   });
-  const events = await requireTranscriptReader()(scope);
-  transcriptReads.load.mockResolvedValueOnce(events).mockRejectedValueOnce(transcriptReadError());
+}
 
-  const { ws } = await openClient();
-  try {
-    const response = await rpcReq(ws, "sessions.compact", { key: "main" });
-
-    expect(response.ok).toBe(false);
-    expect(response.error).toMatchObject({
-      code: "UNAVAILABLE",
-      message: expect.stringContaining("failed to read session transcript storage"),
-    });
-  } finally {
-    ws.close();
-  }
-});
-
-test("sessions.compact maxLines reports transcript preflight read failures as unavailable", async () => {
-  const { storePath } = await createSessionStoreDir();
-  await seedCompactionSession({ sessionId: "sess-max-lines-read-failure", storePath });
-  transcriptReads.load.mockRejectedValueOnce(transcriptReadError());
-
-  const { ws } = await openClient();
-  try {
-    const response = await rpcReq(ws, "sessions.compact", { key: "main", maxLines: 50 });
-
-    expect(response.ok).toBe(false);
-    expect(response.error).toMatchObject({
-      code: "UNAVAILABLE",
-      message: expect.stringContaining("failed to read session transcript storage"),
-    });
-  } finally {
-    ws.close();
-  }
-});
-
-test.each([{ maxLines: undefined }, { maxLines: 50 }])(
-  "sessions.compact keeps an empty transcript as a successful no-op (maxLines=$maxLines)",
-  async ({ maxLines }) => {
+test.each([
+  { stage: "initial", sessionId: "sess-read-failure" },
+  {
+    stage: "model compaction re-read",
+    sessionId: "sess-model-read-failure",
+    nativeHarness: true,
+  },
+  { stage: "maxLines preflight", sessionId: "sess-max-lines-read-failure", maxLines: 50 },
+])(
+  "sessions.compact reports $stage transcript read failures as unavailable",
+  async ({ sessionId, nativeHarness, maxLines }) => {
     const { storePath } = await createSessionStoreDir();
-    await seedCompactionSession({
-      sessionId: `sess-empty-${maxLines ?? "model"}`,
-      storePath,
-      withTranscript: false,
-    });
+    const scope = await seedCompactionSession({ sessionId, storePath, nativeHarness });
+    failTranscriptStatsForSession(
+      sessionId,
+      nativeHarness ? { succeedFirstWith: await realTranscriptStatsReader(scope) } : undefined,
+    );
 
     const { ws } = await openClient();
     try {
-      const response = await rpcReq<{ compacted: boolean; ok: true; reason: string }>(
-        ws,
-        "sessions.compact",
-        { key: "main", ...(maxLines === undefined ? {} : { maxLines }) },
-      );
+      const response = await rpcReq(ws, "sessions.compact", {
+        key: "main",
+        ...(maxLines === undefined ? {} : { maxLines }),
+      });
 
-      expect(response.ok).toBe(true);
-      expect(response.payload).toMatchObject({
-        ok: true,
-        compacted: false,
-        reason: "no transcript",
+      expect(response.ok).toBe(false);
+      expect(response.error).toMatchObject({
+        code: "UNAVAILABLE",
+        message: expect.stringContaining("failed to read session transcript storage"),
+      });
+    } finally {
+      ws.close();
+    }
+  },
+);
+
+test("sessions.compact keeps an empty transcript as a successful no-op", async () => {
+  const { storePath } = await createSessionStoreDir();
+  await seedCompactionSession({
+    sessionId: "sess-empty-model",
+    storePath,
+    withTranscript: false,
+  });
+
+  const { ws } = await openClient();
+  try {
+    const response = await rpcReq<{ compacted: boolean; ok: true; reason: string }>(
+      ws,
+      "sessions.compact",
+      { key: "main" },
+    );
+
+    expect(response.ok).toBe(true);
+    expect(response.payload).toMatchObject({
+      ok: true,
+      compacted: false,
+      reason: "no transcript",
+    });
+  } finally {
+    ws.close();
+  }
+});
+
+test.each([undefined, 2])(
+  "sessions.compact rejects a missing session with maxLines=%s",
+  async (maxLines) => {
+    await createSessionStoreDir();
+    const { ws } = await openClient();
+    try {
+      const response = await rpcReq(ws, "sessions.compact", {
+        key: "agent:main:missing",
+        ...(maxLines === undefined ? {} : { maxLines }),
+      });
+
+      expect(response.ok).toBe(false);
+      expect(response.error).toMatchObject({
+        code: "INVALID_REQUEST",
+        message: expect.stringContaining("Session agent:main:missing not found"),
       });
     } finally {
       ws.close();

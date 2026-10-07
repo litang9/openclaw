@@ -7,8 +7,9 @@ import {
   SELF_HOSTED_DEFAULT_COST,
   SELF_HOSTED_DEFAULT_MAX_TOKENS,
 } from "openclaw/plugin-sdk/provider-setup";
-import { asBoolean, asPositiveSafeInteger } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { resolveLlamaServerEndpoint } from "./endpoint.js";
+import { asPositiveSafeInteger } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { LLAMA_SERVER_DEFAULT_ORIGIN } from "./defaults.js";
+import { normalizeLlamaServerProviderConfig } from "./endpoint.js";
 
 type LlamaServerModelStatus =
   | "unloaded"
@@ -18,25 +19,19 @@ type LlamaServerModelStatus =
   | "downloading"
   | "unknown";
 
-export type LlamaServerModelWire = {
+type LlamaServerModelWire = Record<string, unknown> & {
   id?: unknown;
   object?: unknown;
-  owned_by?: unknown;
   status?: {
     value?: unknown;
     failed?: unknown;
-    exit_code?: unknown;
   };
   architecture?: {
     input_modalities?: unknown;
-    output_modalities?: unknown;
   };
-  meta?: {
-    n_ctx_train?: unknown;
-  } | null;
 };
 
-export type LlamaServerPropsWire = {
+type LlamaServerPropsWire = Record<string, unknown> & {
   n_ctx?: unknown;
   default_generation_settings?: {
     n_ctx?: unknown;
@@ -45,20 +40,14 @@ export type LlamaServerPropsWire = {
       n_predict?: unknown;
     };
   };
-  total_slots?: unknown;
   chat_template_caps?: Record<string, unknown>;
   modalities?: Record<string, unknown>;
-  build_info?: unknown;
-  is_sleeping?: unknown;
 };
 
 export type LlamaServerDiscoveredModel = {
   config: ModelDefinitionConfig;
   status: LlamaServerModelStatus;
   failed: boolean;
-  exitCode?: number;
-  buildInfo?: string;
-  totalSlots?: number;
 };
 
 function normalizeStatus(value: unknown): LlamaServerModelStatus {
@@ -104,19 +93,16 @@ function buildCompat(
   props: LlamaServerPropsWire | undefined,
 ): NonNullable<ModelDefinitionConfig["compat"]> {
   const caps = props?.chat_template_caps;
-  const supportsTools =
-    asBoolean(caps?.supports_tools) === true && asBoolean(caps?.supports_tool_calls) === true;
-  const supportsTypedContent = asBoolean(caps?.supports_typed_content) === true;
   return {
     supportsStore: false,
     supportsDeveloperRole: false,
-    supportsReasoningEffort: false,
+    supportsReasoningEffort: caps?.supports_reasoning_effort === true,
     supportsTemperature: true,
     supportsUsageInStreaming: true,
-    supportsTools,
+    supportsTools: caps?.supports_tool_calls === true,
     supportsStrictMode: false,
     supportsJsonSchemaResponseFormat: true,
-    requiresStringContent: !supportsTypedContent,
+    requiresStringContent: caps?.supports_typed_content !== true,
     maxTokensField: "max_tokens",
   };
 }
@@ -131,65 +117,40 @@ export function mapLlamaServerModel(
     return null;
   }
   const contextWindow = resolveContextWindow(props);
-  const buildInfo = typeof props?.build_info === "string" ? props.build_info.trim() : "";
-  const exitCode = asPositiveSafeInteger(row.status?.exit_code);
+  const compat = buildCompat(props);
   return {
     config: {
       id,
       name: id,
-      reasoning: false,
+      reasoning: compat.supportsReasoningEffort === true,
       input: resolveInput(row, props),
       cost: { ...SELF_HOSTED_DEFAULT_COST },
       contextWindow,
       contextTokens: contextWindow,
       maxTokens: resolveMaxTokens(props, contextWindow),
-      compat: buildCompat(props),
+      compat,
     },
     status: normalizeStatus(row.status?.value),
     failed: row.status?.failed === true,
-    ...(exitCode !== undefined ? { exitCode } : {}),
-    ...(buildInfo ? { buildInfo } : {}),
-    ...(asPositiveSafeInteger(props?.total_slots) !== undefined
-      ? { totalSlots: asPositiveSafeInteger(props?.total_slots) }
-      : {}),
   };
-}
-
-/** Keeps explicit rows first and appends models discovered from the server. */
-function mergeLlamaServerModels(params: {
-  explicitModels?: ModelDefinitionConfig[];
-  discoveredModels: readonly LlamaServerDiscoveredModel[];
-}): ModelDefinitionConfig[] {
-  const explicit = Array.isArray(params.explicitModels) ? params.explicitModels : [];
-  const merged = [...explicit];
-  const seen = new Set(explicit.map((model) => model.id));
-  for (const discovered of params.discoveredModels) {
-    if (seen.has(discovered.config.id)) {
-      continue;
-    }
-    seen.add(discovered.config.id);
-    merged.push(discovered.config);
-  }
-  return merged;
 }
 
 export function buildLlamaServerProviderConfig(params: {
   configured?: ModelProviderConfig;
   discoveredModels: readonly LlamaServerDiscoveredModel[];
 }): ModelProviderConfig {
-  const endpoint = resolveLlamaServerEndpoint(params.configured?.baseUrl);
-  const request = params.configured?.request ?? {};
-  return {
+  const models = Array.isArray(params.configured?.models) ? [...params.configured.models] : [];
+  const seen = new Set(models.map((model) => model.id));
+  for (const discovered of params.discoveredModels) {
+    if (seen.has(discovered.config.id)) {
+      continue;
+    }
+    seen.add(discovered.config.id);
+    models.push(discovered.config);
+  }
+  return normalizeLlamaServerProviderConfig({
     ...params.configured,
-    baseUrl: endpoint.inferenceBaseUrl,
-    api: "openai-completions",
-    request:
-      typeof request.allowPrivateNetwork === "boolean"
-        ? request
-        : { ...request, allowPrivateNetwork: true },
-    models: mergeLlamaServerModels({
-      explicitModels: params.configured?.models,
-      discoveredModels: params.discoveredModels,
-    }),
-  };
+    baseUrl: params.configured?.baseUrl ?? LLAMA_SERVER_DEFAULT_ORIGIN,
+    models,
+  });
 }

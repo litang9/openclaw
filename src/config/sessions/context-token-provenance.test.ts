@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { contextBudgetStatusFixture } from "./context-budget.test-support.js";
 import {
   resolveProjectedSessionContextTokens,
+  resolveProjectedSessionContextBudgetStatus,
   resolveTrustedSessionContextTokens,
 } from "./context-token-provenance.js";
 
@@ -124,6 +126,54 @@ describe("resolveProjectedSessionContextTokens", () => {
     ).toBe(1_000_000);
   });
 
+  it("falls back to the matching persisted resolution while current resolution is unavailable", () => {
+    expect(
+      resolveProjectedSessionContextTokens({
+        entry: { ...matchingRuntimeEntry, contextTokensSource: "resolved-v1" },
+        ...currentSelection,
+        resolvedContextTokens: undefined,
+      }),
+    ).toBe(272_000);
+  });
+
+  it("rejects a legacy resolved row because its producer may have reused a fallback", () => {
+    expect(
+      resolveProjectedSessionContextTokens({
+        entry: { ...matchingRuntimeEntry, contextTokensSource: "resolved" },
+        ...currentSelection,
+        resolvedContextTokens: undefined,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("does not resurrect a removed runtime-configured cap while resolution is unavailable", () => {
+    expect(
+      resolveProjectedSessionContextTokens({
+        entry: { ...matchingRuntimeEntry, contextTokensSource: "runtime-configured" },
+        ...currentSelection,
+        resolvedContextTokens: undefined,
+      }),
+    ).toBeUndefined();
+  });
+
+  it.each([
+    { name: "provider", patch: { modelProvider: "openrouter" } },
+    { name: "model", patch: { model: "gpt-5.5" } },
+    { name: "harness", patch: { agentHarnessId: "openclaw" } },
+  ])("rejects a persisted resolution owned by a different $name", ({ patch }) => {
+    expect(
+      resolveProjectedSessionContextTokens({
+        entry: {
+          ...matchingRuntimeEntry,
+          contextTokensSource: "resolved-v1",
+          ...patch,
+        },
+        ...currentSelection,
+        resolvedContextTokens: undefined,
+      }),
+    ).toBeUndefined();
+  });
+
   it("preserves a locked native window ahead of current configuration", () => {
     expect(
       resolveProjectedSessionContextTokens({
@@ -136,5 +186,73 @@ describe("resolveProjectedSessionContextTokens", () => {
         authoredContextTokens: 272_000,
       }),
     ).toBe(1_000_000);
+  });
+});
+
+describe("resolveProjectedSessionContextBudgetStatus", () => {
+  const entry = { sessionId: "session-1", contextBudgetStatus: contextBudgetStatusFixture() };
+  const selection = { provider: "ollama", model: "qwen3:8b", contextTokens: 200_000 };
+
+  it("keeps a last-run estimate with a matching cap", () => {
+    expect(resolveProjectedSessionContextBudgetStatus({ entry, ...selection })).toEqual(
+      entry.contextBudgetStatus,
+    );
+  });
+
+  it.each([
+    { name: "model", current: { model: "qwen3:4b" } },
+    { name: "missing model", current: { model: undefined } },
+    { name: "missing provider", current: { provider: undefined } },
+    { name: "unknown cap", current: { contextTokens: undefined } },
+    { name: "provider", current: { provider: "lmstudio" } },
+    { name: "lower cap", current: { contextTokens: 100_000 } },
+    { name: "higher cap", current: { contextTokens: 1_000_000 } },
+  ])("rejects a budget after the $name changes", ({ current }) => {
+    expect(
+      resolveProjectedSessionContextBudgetStatus({ entry, ...selection, ...current }),
+    ).toBeUndefined();
+  });
+
+  it.each([{ sessionId: "session-2" }, { liveModelSwitchPending: true }])(
+    "rejects a stale session lifecycle %j",
+    (patch) => {
+      expect(
+        resolveProjectedSessionContextBudgetStatus({ entry: { ...entry, ...patch }, ...selection }),
+      ).toBeUndefined();
+    },
+  );
+
+  it.each([undefined, " "])("rejects an unbound snapshot session ID %j", (sessionId) => {
+    expect(
+      resolveProjectedSessionContextBudgetStatus({
+        entry: { ...entry, contextBudgetStatus: { ...entry.contextBudgetStatus, sessionId } },
+        ...selection,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("keeps a narrower budget owned by the serving runtime", () => {
+    const runtimeEntry = {
+      ...entry,
+      modelProvider: "ollama",
+      model: "qwen3:8b",
+      agentHarnessId: "openclaw",
+      contextTokens: 200_000,
+      contextTokensSource: "runtime" as const,
+    };
+    const contextTokens = resolveProjectedSessionContextTokens({
+      entry: runtimeEntry,
+      ...selection,
+      agentHarnessId: "openclaw",
+      resolvedContextTokens: 262_144,
+    });
+    expect(contextTokens).toBe(200_000);
+    expect(
+      resolveProjectedSessionContextBudgetStatus({
+        entry: runtimeEntry,
+        ...selection,
+        contextTokens,
+      }),
+    ).toEqual(entry.contextBudgetStatus);
   });
 });

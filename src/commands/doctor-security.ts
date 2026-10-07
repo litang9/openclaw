@@ -1,6 +1,6 @@
-/** Security warnings for gateway exposure, exec policy drift, channel DMs, and plaintext secrets. */
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { note } from "../../packages/terminal-core/src/note.js";
+import { listAgentEntriesWithSource } from "../agents/agent-scope-config.js";
 import { listReadOnlyChannelPluginsForConfig } from "../channels/plugins/read-only.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import type { OpenClawConfig, GatewayBindMode } from "../config/config.js";
@@ -10,15 +10,18 @@ import { resolveGatewayAuthTokenSourceConflict } from "../gateway/auth-token-sou
 import { resolveGatewayAuth } from "../gateway/auth.js";
 import { isLoopbackHost, resolveGatewayBindHost } from "../gateway/net.js";
 import { resolveExecPolicyScopeSnapshot } from "../infra/exec-approvals-effective.js";
+import { countObsoleteGeneratedExecApprovals } from "../infra/exec-approvals-generated-migration.js";
+import { ExecApprovalsMigrationRequiredError } from "../infra/exec-approvals-migration-gate.js";
 import {
   loadExecApprovalsReadOnly,
   resolveExecApprovalsDisplayPath,
+  type ExecApprovalsFile,
   type ExecAsk,
   type ExecMode,
   type ExecSecurity,
 } from "../infra/exec-approvals.js";
-import { isLikelySensitiveModelProviderHeaderName } from "../secrets/model-provider-header-policy.js";
-import { hasConfiguredPlaintextSecretValue } from "../secrets/secret-value.js";
+import { findSecretStoreRedactedValueFindings } from "../secrets/audit-store.js";
+import { classifyConfigSecretTarget } from "../secrets/config-secret-target.js";
 import { discoverConfigSecretTargets } from "../secrets/target-registry.js";
 import { collectChannelSecurityFindingsCore } from "../security/audit-channel.js";
 import type { SecurityAuditFinding } from "../security/audit.types.js";
@@ -55,45 +58,25 @@ function collectImplicitHeartbeatDirectPolicyWarnings(cfg: OpenClawConfig): Secu
     pathHint: "agents.defaults.heartbeat.directPolicy",
   });
 
-  const agents = Array.isArray(cfg.agents?.list) ? cfg.agents.list : [];
-  for (const agent of agents) {
+  for (const { entry: agent, source } of listAgentEntriesWithSource(cfg)) {
     maybeWarn({
       label: `Heartbeat agent "${agent.id}"`,
       heartbeat: agent.heartbeat,
-      pathHint: `heartbeat.directPolicy for agent "${agent.id}"`,
+      pathHint:
+        source.kind === "entries"
+          ? `agents.entries.${source.key}.heartbeat.directPolicy`
+          : `heartbeat.directPolicy for agent "${agent.id}"`,
     });
   }
 
   return findings;
 }
 
-function execSecurityRank(value: ExecSecurity): number {
-  switch (value) {
-    case "deny":
-      return 0;
-    case "allowlist":
-      return 1;
-    case "full":
-      return 2;
-  }
-  throw new Error("Unsupported exec security value");
-}
-
-function execAskRank(value: ExecAsk): number {
-  switch (value) {
-    case "off":
-      return 0;
-    case "on-miss":
-      return 1;
-    case "always":
-      return 2;
-  }
-  throw new Error("Unsupported exec ask value");
-}
-
-function collectExecPolicyConflictWarnings(cfg: OpenClawConfig): SecurityAuditFinding[] {
+function collectExecPolicyConflictWarnings(
+  cfg: OpenClawConfig,
+  approvals: ExecApprovalsFile,
+): SecurityAuditFinding[] {
   const findings: SecurityAuditFinding[] = [];
-  const approvals = loadExecApprovalsReadOnly();
   const defaultRequestedSecuritySource = "OpenClaw default (full)";
   const defaultRequestedAskSource = "OpenClaw default (off)";
 
@@ -129,10 +112,8 @@ function collectExecPolicyConflictWarnings(cfg: OpenClawConfig): SecurityAuditFi
     const securityConfigured = snapshot.security.requestedSource !== defaultRequestedSecuritySource;
     const askConfigured = snapshot.ask.requestedSource !== defaultRequestedAskSource;
     const securityConflict =
-      securityConfigured &&
-      execSecurityRank(snapshot.security.requested) > execSecurityRank(snapshot.security.effective);
-    const askConflict =
-      askConfigured && execAskRank(snapshot.ask.requested) < execAskRank(snapshot.ask.effective);
+      securityConfigured && snapshot.security.requested !== snapshot.security.effective;
+    const askConflict = askConfigured && snapshot.ask.requested !== snapshot.ask.effective;
     if (!securityConflict && !askConflict) {
       return;
     }
@@ -169,7 +150,7 @@ function collectExecPolicyConflictWarnings(cfg: OpenClawConfig): SecurityAuditFi
         `Config: ${configParts.join(", ")}`,
         `Host: ${hostParts.join(", ")}`,
         `Effective host exec stays security="${snapshot.security.effective}" ask="${snapshot.ask.effective}" because the stricter side wins.`,
-        "Headless runs like isolated cron cannot answer approval prompts; align both files or enable Web UI, terminal UI, or chat exec approvals.",
+        "Headless runs like isolated cron cannot answer approval prompts; align both files, or keep the Control UI or a macOS/iOS/Android app connected so gateway automation runs can raise approval cards.",
         `Inspect with: ${formatCliCommand("openclaw approvals get --gateway")}`,
       ].join("\n"),
     });
@@ -193,9 +174,24 @@ function collectExecPolicyConflictWarnings(cfg: OpenClawConfig): SecurityAuditFi
   return findings;
 }
 
-function collectDurableExecApprovalWarnings(cfg: OpenClawConfig): SecurityAuditFinding[] {
-  void cfg;
-  return [];
+function collectDurableExecApprovalWarnings(approvals: ExecApprovalsFile): SecurityAuditFinding[] {
+  const count = countObsoleteGeneratedExecApprovals(approvals);
+  if (count === 0) {
+    return [];
+  }
+  return [
+    {
+      checkId: "doctor.exec_approvals_require_cwd_renewal",
+      severity: "warn",
+      title: "Exec approvals need renewal",
+      detail: `${count} older generated ${count === 1 ? "approval is" : "approvals are"} inactive because they are not tied to a working directory.`,
+      remediation: [
+        `Run ${formatCliCommand("openclaw doctor --fix")} to remove the inactive entries.`,
+        'Then rerun affected workflows and choose "Always allow here" when prompted.',
+        "Manual allowlist rules are unchanged.",
+      ].join("\n"),
+    },
+  ];
 }
 
 function collectExecFilesystemPolicyWarnings(cfg: OpenClawConfig): SecurityAuditFinding[] {
@@ -215,30 +211,10 @@ function collectExecFilesystemPolicyWarnings(cfg: OpenClawConfig): SecurityAudit
 
 function collectPlaintextConfigSecretWarnings(cfg: OpenClawConfig): SecurityAuditFinding[] {
   const plaintextPaths: string[] = [];
-  const defaults = cfg.secrets?.defaults;
-
   for (const target of discoverConfigSecretTargets(cfg)) {
-    if (!target.entry.includeInAudit) {
-      continue;
+    if (classifyConfigSecretTarget(cfg, target).plaintext) {
+      plaintextPaths.push(target.path);
     }
-    if (
-      target.entry.id === "models.providers.*.headers.*" &&
-      !isLikelySensitiveModelProviderHeaderName(target.pathSegments.at(-1) ?? "")
-    ) {
-      continue;
-    }
-    const { ref } = resolveSecretInputRef({
-      value: target.value,
-      refValue: target.refValue,
-      defaults,
-    });
-    if (ref) {
-      continue;
-    }
-    if (!hasConfiguredPlaintextSecretValue(target.value, target.entry.expectedResolvedValue)) {
-      continue;
-    }
-    plaintextPaths.push(target.path);
   }
 
   if (plaintextPaths.length === 0) {
@@ -257,15 +233,14 @@ function collectPlaintextConfigSecretWarnings(cfg: OpenClawConfig): SecurityAudi
       title: "WARNING",
       detail: "openclaw.json contains plaintext secret-bearing config fields.",
       remediation: [
+        `Migrate them to SecretRefs with ${formatCliCommand("openclaw secrets configure")} or ${formatCliCommand("openclaw secrets apply")}, then verify with ${formatCliCommand("openclaw secrets audit --check")}.`,
         `Paths: ${pathLine}`,
         "Agents or workspace tools that can read config files may see these API keys/tokens.",
-        `Migrate them to SecretRefs with ${formatCliCommand("openclaw secrets configure")} or ${formatCliCommand("openclaw secrets apply")}, then verify with ${formatCliCommand("openclaw secrets audit --check")}.`,
       ].join("\n"),
     },
   ];
 }
 
-/** Collects doctor security findings without emitting terminal notes. */
 export async function collectSecurityWarnings(
   cfg: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
@@ -286,10 +261,42 @@ export async function collectSecurityWarnings(
   }
 
   findings.push(...collectImplicitHeartbeatDirectPolicyWarnings(cfg));
-  findings.push(...collectExecPolicyConflictWarnings(cfg));
+  let approvals: ExecApprovalsFile | undefined;
+  try {
+    approvals = loadExecApprovalsReadOnly();
+  } catch (error) {
+    if (!(error instanceof ExecApprovalsMigrationRequiredError)) {
+      throw error;
+    }
+    // Preflight already reported why it preserved the legacy source.
+    // Skip only approval-dependent checks so the rest of Doctor can continue.
+  }
+  if (approvals) {
+    findings.push(...collectExecPolicyConflictWarnings(cfg, approvals));
+  }
   findings.push(...collectExecFilesystemPolicyWarnings(cfg));
   findings.push(...collectPlaintextConfigSecretWarnings(cfg));
-  findings.push(...collectDurableExecApprovalWarnings(cfg));
+  const gatewayTokenRef = resolveSecretInputRef({
+    value: cfg.gateway?.auth?.token,
+    defaults: cfg.secrets?.defaults,
+  }).ref;
+  findings.push(
+    ...(await findSecretStoreRedactedValueFindings({ database: { env } })).map(
+      (finding): SecurityAuditFinding => ({
+        checkId: "doctor.secret_store_redacted_value",
+        severity: "warn",
+        title: "Unavailable credential",
+        detail: finding.message,
+        remediation:
+          gatewayTokenRef?.source === "store" && gatewayTokenRef.id === finding.name
+            ? "Run `openclaw doctor --fix` to regenerate the Gateway token, then restart and reconnect or re-pair devices."
+            : `This credential remains unavailable until replaced. Run \`openclaw secrets store set ${finding.name}\` with the real credential, then \`openclaw secrets reload\`.`,
+      }),
+    ),
+  );
+  if (approvals) {
+    findings.push(...collectDurableExecApprovalWarnings(approvals));
+  }
 
   // Network exposure needs auth proof before doctor can treat non-loopback bind as intentional.
   const tailscaleMode = cfg.gateway?.tailscale?.mode ?? "off";
@@ -328,7 +335,7 @@ export async function collectSecurityWarnings(
   ];
 
   if (isExposed) {
-    if (!hasSharedSecret) {
+    if (!hasSharedSecret && resolvedAuth.mode !== "trusted-proxy") {
       const authFixLines =
         resolvedAuth.mode === "password"
           ? [
@@ -356,7 +363,6 @@ export async function collectSecurityWarnings(
         ].join("\n"),
       });
     } else {
-      // Auth is configured, but still warn about network exposure
       findings.push({
         checkId: "gateway.bind_network_accessible",
         severity: "warn",
@@ -404,7 +410,6 @@ function renderSecurityFindingLines(finding: SecurityAuditFinding): string[] {
   return lines;
 }
 
-/** Emits security warnings plus the deep audit follow-up command. */
 export async function noteSecurityWarnings(cfg: OpenClawConfig) {
   const findings = await collectSecurityWarnings(cfg);
   if (findings.length > 0) {
@@ -412,4 +417,5 @@ export async function noteSecurityWarnings(cfg: OpenClawConfig) {
     lines.push(`- Run: ${formatCliCommand("openclaw security audit --deep")}`);
     note(lines.join("\n"), "Security");
   }
+  return findings;
 }

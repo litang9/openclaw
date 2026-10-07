@@ -1,18 +1,39 @@
+import { availableWorkerSlots } from "../../../../packages/gateway-protocol/src/worker-capacity.ts";
 import { t } from "../../i18n/index.ts";
+import { registerNewSessionSetupEnglish } from "../../i18n/locales/en-new-session-setup.ts";
 import type { DraftEnvironment } from "./discovery.ts";
-import { environmentMenuFacts } from "./place-facts.ts";
+import { environmentMenuFacts, MAX_PLACE_MENU_FACTS } from "./place-facts.ts";
 import { disambiguate } from "./place-labels.ts";
 
-export type DevicePlacementOption = Readonly<{
-  deviceId: string;
-  label: string;
-  subtitle?: string;
-  facts: readonly string[];
-  selectable: boolean;
-  disabledReason?: string;
+registerNewSessionSetupEnglish();
+
+export type DevicePlacementOption = Readonly<
+  {
+    deviceId: string;
+    label: string;
+    subtitle?: string;
+    hideDetails?: boolean;
+    remediation?: "enable-session-hosting" | "update-device";
+    facts: readonly string[];
+    selectable: boolean;
+    disabledReason?: string;
+  } & Pick<DraftEnvironment, "platform" | "workerSlots" | "capabilities" | "invocableCommands">
+>;
+
+export type DevicePlacementRequirement = Readonly<{
+  requiredNodeCommands: readonly string[];
+  consumesWorkerSlot: boolean;
 }>;
 
-function unavailableReason(environment: DraftEnvironment): string | undefined {
+const DEFAULT_DEVICE_PLACEMENT: DevicePlacementRequirement = {
+  requiredNodeCommands: [],
+  consumesWorkerSlot: true,
+};
+
+function unavailableReason(
+  environment: DraftEnvironment,
+  requirement: DevicePlacementRequirement,
+): string | undefined {
   const updateIssue = environment.issues?.find((issue) => issue.code === "update-required");
   if (updateIssue) {
     return t("newSession.nodeUpdateRequired", {
@@ -20,21 +41,50 @@ function unavailableReason(environment: DraftEnvironment): string | undefined {
       restartCommand: updateIssue.headlessReconnectCommand,
     });
   }
+  const hostIssue = environment.issues?.find((issue) => issue.code === "worker-host-unavailable");
+  if (hostIssue) {
+    return hostIssue.message;
+  }
   if (environment.status !== "available") {
     return t("newSession.deviceUnavailable");
   }
   if (environment.sessionHost !== true) {
     return t("newSession.sessionHostingDisabled");
   }
+  if (requirement.requiredNodeCommands.length > 0) {
+    const requiredCommand = environment.requiredNodeCommand;
+    if (!requiredCommand) {
+      return t("newSession.placementNotReady");
+    }
+    if (requiredCommand.state !== "invocable" && requiredCommand.message) {
+      return requiredCommand.message;
+    }
+    if (requiredCommand.state === "pending-approval") {
+      return t("newSession.nodeCommandPendingApproval", { command: requiredCommand.command });
+    }
+    if (requiredCommand.state === "undeclared") {
+      return t("newSession.nodeCommandUndeclared", { command: requiredCommand.command });
+    }
+    if (requiredCommand.state === "unauthorized") {
+      return t("newSession.nodeCommandUnauthorized", { command: requiredCommand.command });
+    }
+  }
+  if (!requirement.consumesWorkerSlot) {
+    return undefined;
+  }
   if (!environment.workerSlots) {
     return t("newSession.deviceCapacityUnavailable");
   }
-  return environment.workerSlots.available === 0 ? t("newSession.deviceNoSlots") : undefined;
+  return availableWorkerSlots(environment.workerSlots) === 0
+    ? t("newSession.deviceNoSlots")
+    : undefined;
 }
 
 /** One projection owns device presentation, restore eligibility, and submit eligibility. */
 export function projectDevicePlacements(
   environments: readonly DraftEnvironment[] | null,
+  requirement: DevicePlacementRequirement = DEFAULT_DEVICE_PLACEMENT,
+  placementDisabledReason?: string,
 ): DevicePlacementOption[] {
   const devices = (environments ?? [])
     .flatMap<DevicePlacementOption>((environment) => {
@@ -45,23 +95,41 @@ export function projectDevicePlacements(
       if (!deviceId) {
         return [];
       }
-      const disabledReason = unavailableReason(environment);
+      const disabledReason = placementDisabledReason ?? unavailableReason(environment, requirement);
       const facts = environmentMenuFacts(environment, {
         connected: environment.status === "available",
       });
       const priorityFacts =
         (environment.issues?.length ?? 0) > 0 || environment.status !== "available" ? 1 : 0;
-      const slotFacts = environment.workerSlots ? 1 : 0;
-      const insertion = priorityFacts + slotFacts;
       const visibleFacts =
         disabledReason && !facts.includes(disabledReason)
-          ? [...facts.slice(0, insertion), disabledReason, ...facts.slice(insertion)].slice(0, 4)
+          ? [...facts.slice(0, priorityFacts), disabledReason, ...facts.slice(priorityFacts)].slice(
+              0,
+              MAX_PLACE_MENU_FACTS,
+            )
           : facts;
       return [
         {
           deviceId,
           label: environment.label ?? deviceId,
-          facts: visibleFacts,
+          platform: environment.platform,
+          hideDetails:
+            !placementDisabledReason &&
+            environment.status === "unavailable" &&
+            !environment.issues?.length,
+          remediation: placementDisabledReason
+            ? undefined
+            : environment.issues?.some((issue) => issue.code === "update-required")
+              ? "update-device"
+              : environment.status === "available" &&
+                  environment.sessionHost !== true &&
+                  !environment.issues?.length
+                ? "enable-session-hosting"
+                : undefined,
+          facts: placementDisabledReason ? [placementDisabledReason] : visibleFacts,
+          workerSlots: environment.workerSlots,
+          capabilities: environment.capabilities,
+          invocableCommands: environment.invocableCommands,
           selectable: disabledReason === undefined,
           ...(disabledReason ? { disabledReason } : {}),
         },
@@ -74,17 +142,57 @@ export function projectDevicePlacements(
   const subtitles = disambiguate(devices, (device) => device.label, [
     (device) => device.deviceId.slice(0, 8),
   ]);
-  const projected: DevicePlacementOption[] = [];
-  for (const [index, device] of devices.entries()) {
+  devices.forEach((device, index) => {
     const subtitle = subtitles[index];
-    projected.push(subtitle ? { ...device, subtitle } : device);
-  }
-  return projected;
+    if (subtitle) {
+      devices[index] = { ...device, subtitle };
+    }
+  });
+  return devices;
 }
 
-export function findDevicePlacement(
+export function resolveAutomaticDevicePlacementDisabledReason(
   environments: readonly DraftEnvironment[] | null,
-  deviceId: string,
-): DevicePlacementOption | undefined {
-  return projectDevicePlacements(environments).find((device) => device.deviceId === deviceId);
+  devices: readonly DevicePlacementOption[],
+  runtimeDisabledReason?: string,
+): string | undefined {
+  if (runtimeDisabledReason) {
+    return runtimeDisabledReason;
+  }
+  const sessionHostIds = new Set(
+    (environments ?? [])
+      .filter((environment) => environment.type === "node" && environment.sessionHost === true)
+      .map((environment) => environment.id),
+  );
+  if (sessionHostIds.size === 0) {
+    const unavailable = (environments ?? []).find((environment) =>
+      environment.issues?.some(
+        (issue) => issue.code === "update-required" || issue.code === "worker-host-unavailable",
+      ),
+    );
+    return unavailable
+      ? unavailableReason(unavailable, DEFAULT_DEVICE_PLACEMENT)
+      : t("newSession.noSessionHosts");
+  }
+  return devices.some((device) => device.selectable)
+    ? undefined
+    : devices.find((device) => sessionHostIds.has(`node:${device.deviceId}`))?.disabledReason;
+}
+
+export function resolveSelectedDevicePlacement(
+  devices: readonly DevicePlacementOption[],
+  environments: readonly DraftEnvironment[] | null,
+  selection: Readonly<{ deviceId: string; autoDevice: boolean }>,
+) {
+  const selected = devices.find((device) => device.deviceId === selection.deviceId);
+  return {
+    ready: selection.autoDevice
+      ? devices.some((device) => device.selectable)
+      : !selection.deviceId || selected?.selectable === true,
+    disabledReason: selection.autoDevice
+      ? resolveAutomaticDevicePlacementDisabledReason(environments, devices)
+      : !selection.deviceId
+        ? undefined
+        : (selected?.disabledReason ?? t("newSession.nodeUnavailable")),
+  };
 }

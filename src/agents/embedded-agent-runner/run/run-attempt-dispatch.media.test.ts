@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { buildInboundMediaNoteProjection } from "../../../auto-reply/media-note.js";
 import { readRuntimePromptImageFactIndexes } from "../../../media/runtime-prompt-image-provenance.js";
 import { captureEnv, setTestEnvValue } from "../../../test-utils/env.js";
-import { prepareEmbeddedAttemptPromptExecution } from "./attempt-prompt-submit.js";
+import { prepareEmbeddedAttemptPromptExecution } from "./prompt-image-preparation.js";
 
 async function preparePluginHarnessPromptImages(params: {
   runParams: Parameters<typeof prepareEmbeddedAttemptPromptExecution>[0]["attempt"];
@@ -117,6 +117,9 @@ describe("plugin harness prompt media", () => {
           sessionId: "session-canonical-media",
           userTurnTranscriptRecorder: {
             message: { role: "user", content: "inspect", __openclaw: { media } },
+            async resolveMessage() {
+              return this.message;
+            },
           },
         },
         runtime: {
@@ -130,8 +133,10 @@ describe("plugin harness prompt media", () => {
       expect(result.images ?? []).toHaveLength(testCase.expectedImages);
       if (testCase.expectedImages > 0) {
         expect(result.images?.[0]?.mimeType).toBe("image/png");
+        expect(result.media).toBeUndefined();
+      } else {
+        expect(result.media).toMatchObject(media);
       }
-      expect(result.media).toBeUndefined();
     } finally {
       envSnapshot.restore();
       await fs.rm(stateDir, { recursive: true, force: true });
@@ -164,11 +169,18 @@ describe("plugin harness prompt media", () => {
         userTurnTranscriptRecorder: {
           message: {
             role: "user",
-            content: "inspect",
-            __openclaw: {
-              media: [{ path: imagePath, contentType: "image/png" }, documentFact],
-              mediaImageLayout: { slots: [{ kind: "offloaded", factIndex: 0 }] },
-            },
+            content: "stale initial facts",
+            __openclaw: { media: [documentFact] },
+          },
+          async resolveMessage() {
+            return {
+              role: "user",
+              content: "inspect",
+              __openclaw: {
+                media: [{ path: imagePath, contentType: "image/png" }, documentFact],
+                mediaImageLayout: { slots: [{ kind: "offloaded", factIndex: 0 }] },
+              },
+            };
           },
         },
       },
@@ -188,7 +200,7 @@ describe("plugin harness prompt media", () => {
       ]);
       expect(readRuntimePromptImageFactIndexes(result.images ?? [])).toEqual([0]);
       expect(result.imageOrder).toEqual(["inline"]);
-      expect(result.media).toBeUndefined();
+      expect(result.media).toMatchObject([documentFact]);
       expect(JSON.stringify(result)).not.toContain(imagePath);
       expect(structuredClone(result).images).toEqual(result.images);
     } finally {
@@ -484,6 +496,9 @@ describe("plugin harness prompt media", () => {
         ],
         sessionId: "session-layout-suppressed",
         userTurnTranscriptRecorder: {
+          async resolveMessage() {
+            return this.message;
+          },
           message: {
             role: "user",
             content: "compare",

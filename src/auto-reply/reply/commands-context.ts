@@ -1,4 +1,3 @@
-/** Builds normalized command context from inbound message and authorization state. */
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -11,7 +10,11 @@ import type { MsgContext } from "../templating.js";
 import type { CommandContext } from "./commands-types.js";
 import { stripMentions } from "./mentions.js";
 
-/** Builds command routing/auth metadata consumed by command handlers. */
+/** Selection and execution must bind to the same channel, including origin-routed turns. */
+export function resolveCommandChannel(ctx: MsgContext): string {
+  return normalizeLowercaseStringOrEmpty(ctx.OriginatingChannel ?? ctx.Provider ?? ctx.Surface);
+}
+
 export function buildCommandContext(params: {
   ctx: MsgContext;
   cfg: OpenClawConfig;
@@ -28,9 +31,7 @@ export function buildCommandContext(params: {
     commandAuthorized: params.commandAuthorized,
   });
   const surface = normalizeLowercaseStringOrEmpty(ctx.Surface ?? ctx.Provider);
-  const channel = normalizeLowercaseStringOrEmpty(
-    ctx.OriginatingChannel ?? ctx.Provider ?? surface,
-  );
+  const channel = resolveCommandChannel(ctx);
   const from = auth.from ?? normalizeOptionalString(ctx.SenderId);
   const to = auth.to ?? normalizeOptionalString(ctx.OriginatingTo);
   const abortKey = sessionKey ?? from ?? to;
@@ -50,6 +51,7 @@ export function buildCommandContext(params: {
     accountId: normalizeOptionalString(ctx.AccountId),
     ownerList: auth.ownerList,
     senderIsOwner: auth.senderIsOwner,
+    ...(auth.assertOwnerCurrent ? { assertOwnerCurrent: auth.assertOwnerCurrent } : {}),
     isAuthorizedSender: auth.isAuthorizedSender,
     senderId: auth.senderId,
     abortKey,

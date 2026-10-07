@@ -125,6 +125,40 @@ describe("fetchKimiUsage", () => {
 });
 
 describe("fetchKimiUsage window parsing", () => {
+  it("parses current managed ratios and reset timestamps", async () => {
+    await expect(
+      expectParsedWindows({
+        usages: {
+          limit_5h: { used_ratio: "0.125", reset_time: "2026-10-07T12:00:00Z" },
+          limit_7d: { used_ratio: 1.5, reset_time: "invalid" },
+        },
+      }),
+    ).resolves.toEqual([
+      { label: "5h", usedPercent: 12.5, resetAt: Date.parse("2026-10-07T12:00:00Z") },
+      { label: "7d", usedPercent: 100 },
+    ]);
+  });
+
+  it.each([{}, { usages: {} }, { usages: { limit_5h: { used_ratio: "" } } }])(
+    "reports an unreadable successful response explicitly: %j",
+    async (body) => {
+      const mockFetch = createProviderUsageFetch(async () => makeResponse(200, body));
+      await expect(fetchKimiUsage("test-key", 1000, mockFetch)).resolves.toMatchObject({
+        windows: [],
+        error: "Malformed usage response",
+      });
+    },
+  );
+
+  it("never requests a custom usage endpoint", async () => {
+    const mockFetch = vi.fn<typeof fetch>();
+    await expect(
+      fetchKimiUsage("test-key", 1000, mockFetch, {
+        baseUrl: "https://proxy.example.test/coding/",
+      }),
+    ).resolves.toMatchObject({ error: "Unsupported usage endpoint" });
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
   it("parses seven-day usage and five-hour named limit", async () => {
     await expect(
       expectParsedWindows({

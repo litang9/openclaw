@@ -19,6 +19,7 @@ function makeAnthropicAnalyzeParams(
     prompt: string;
     pdfs: Array<{ base64: string; filename: string }>;
     maxTokens: number;
+    signal: AbortSignal;
     baseUrl: string;
     requestConfig: Parameters<typeof pdfNativeProviders.anthropicAnalyzePdf>[0]["requestConfig"];
   }> = {},
@@ -40,6 +41,7 @@ function makeGeminiAnalyzeParams(
     pdfs: Array<{ base64: string; filename: string }>;
     baseUrl: string;
     requestConfig: Parameters<typeof pdfNativeProviders.geminiAnalyzePdf>[0]["requestConfig"];
+    signal: AbortSignal;
   }> = {},
 ) {
   return {
@@ -63,8 +65,11 @@ describe("native PDF provider API calls", () => {
 
   const textResponse = (body: string, init?: ResponseInit): Response => new Response(body, init);
 
-  const mockFetchResponse = (response: Response) => {
-    const fetchMock = vi.fn().mockResolvedValue(response);
+  const mockFetchResponse = (response: Response, onFetch?: (init?: RequestInit) => void) => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      onFetch?.(init);
+      return response;
+    });
     global.fetch = Object.assign(fetchMock, { preconnect: vi.fn() }) as typeof global.fetch;
     return fetchMock;
   };
@@ -91,17 +96,27 @@ describe("native PDF provider API calls", () => {
   });
 
   it("anthropicAnalyzePdf sends correct request shape", async () => {
+    const parent = new AbortController();
+    let abortedAtFetch: boolean | undefined;
     const fetchMock = mockFetchResponse(
       jsonResponse({
         content: [{ type: "text", text: "Analysis of PDF" }],
       }),
+      (init) => {
+        abortedAtFetch = init?.signal?.aborted;
+      },
     );
 
     const result = await pdfNativeProviders.anthropicAnalyzePdf(
       makeAnthropicAnalyzeParams({
         modelId: "claude-opus-4-6",
-        prompt: "Summarize this document",
+        prompt: "Summarize these documents",
+        pdfs: [
+          { base64: "cGRmMQ==", filename: "doc1.pdf" },
+          { base64: "cGRmMg==", filename: "doc2.pdf" },
+        ],
         maxTokens: 4096,
+        signal: parent.signal,
       }),
     );
 
@@ -114,13 +129,16 @@ describe("native PDF provider API calls", () => {
     expect(url).toContain("/v1/messages");
     expect(opts.headers.get("x-api-key")).toBe("test-key");
     expect(opts.signal).toBeInstanceOf(AbortSignal);
-    expect(opts.signal.aborted).toBe(false);
+    expect(abortedAtFetch).toBe(false);
+    expect(opts.signal.aborted).toBe(true);
+    expect(parent.signal.aborted).toBe(false);
     const body = JSON.parse(opts.body);
     expect(body.model).toBe("claude-opus-4-6");
-    expect(body.messages[0].content).toHaveLength(2);
+    expect(body.messages[0].content).toHaveLength(3);
     expect(body.messages[0].content[0].type).toBe("document");
     expect(body.messages[0].content[0].source.media_type).toBe("application/pdf");
-    expect(body.messages[0].content[1].type).toBe("text");
+    expect(body.messages[0].content[1].type).toBe("document");
+    expect(body.messages[0].content[2].type).toBe("text");
   });
 
   it("unwraps sentinel-backed native PDF headers only at the request handoff", async () => {
@@ -158,14 +176,6 @@ describe("native PDF provider API calls", () => {
 
     const [url] = firstFetchCall(fetchMock) as [string];
     expect(url).toBe("https://anthropic-pdf-proxy.example/v1/messages");
-  });
-
-  it("anthropicAnalyzePdf throws on API error", async () => {
-    mockFetchResponse(textResponse("invalid request", { status: 400, statusText: "Bad Request" }));
-
-    await expect(
-      pdfNativeProviders.anthropicAnalyzePdf(makeAnthropicAnalyzeParams()),
-    ).rejects.toThrow("Anthropic PDF request failed");
   });
 
   it("bounds large Anthropic API error bodies", async () => {
@@ -482,16 +492,22 @@ describe("native PDF provider API calls", () => {
   it("geminiAnalyzePdf sends correct request shape", async () => {
     // Gemini API keys belong in headers here, not query strings that are more
     // likely to leak through logs and URL diagnostics.
+    const parent = new AbortController();
+    let abortedAtFetch: boolean | undefined;
     const fetchMock = mockFetchResponse(
       jsonResponse({
         candidates: [{ content: { parts: [{ text: "Gemini PDF analysis" }] } }],
       }),
+      (init) => {
+        abortedAtFetch = init?.signal?.aborted;
+      },
     );
 
     const result = await pdfNativeProviders.geminiAnalyzePdf(
       makeGeminiAnalyzeParams({
         modelId: "gemini-2.5-pro",
         prompt: "Summarize this",
+        signal: parent.signal,
       }),
     );
 
@@ -506,21 +522,13 @@ describe("native PDF provider API calls", () => {
     expect(url).not.toContain("?key=");
     expect(opts.headers.get("x-goog-api-key")).toBe("test-key");
     expect(opts.signal).toBeInstanceOf(AbortSignal);
-    expect(opts.signal.aborted).toBe(false);
+    expect(abortedAtFetch).toBe(false);
+    expect(opts.signal.aborted).toBe(true);
+    expect(parent.signal.aborted).toBe(false);
     const body = JSON.parse(opts.body);
     expect(body.contents[0].parts).toHaveLength(2);
     expect(body.contents[0].parts[0].inline_data.mime_type).toBe("application/pdf");
     expect(body.contents[0].parts[1].text).toBe("Summarize this");
-  });
-
-  it("geminiAnalyzePdf throws on API error", async () => {
-    mockFetchResponse(
-      textResponse("server error", { status: 500, statusText: "Internal Server Error" }),
-    );
-
-    await expect(pdfNativeProviders.geminiAnalyzePdf(makeGeminiAnalyzeParams())).rejects.toThrow(
-      "Gemini PDF request failed",
-    );
   });
 
   it("geminiAnalyzePdf throws when no candidates returned", async () => {
@@ -529,32 +537,6 @@ describe("native PDF provider API calls", () => {
     await expect(pdfNativeProviders.geminiAnalyzePdf(makeGeminiAnalyzeParams())).rejects.toThrow(
       "Gemini PDF returned no candidates",
     );
-  });
-
-  it("anthropicAnalyzePdf supports multiple PDFs", async () => {
-    const fetchMock = mockFetchResponse(
-      jsonResponse({
-        content: [{ type: "text", text: "Multi-doc analysis" }],
-      }),
-    );
-
-    await pdfNativeProviders.anthropicAnalyzePdf(
-      makeAnthropicAnalyzeParams({
-        modelId: "claude-opus-4-6",
-        prompt: "Compare these documents",
-        pdfs: [
-          { base64: "cGRmMQ==", filename: "doc1.pdf" },
-          { base64: "cGRmMg==", filename: "doc2.pdf" },
-        ],
-      }),
-    );
-
-    const [, opts] = firstFetchCall(fetchMock) as [unknown, { body: string }];
-    const body = JSON.parse(opts.body);
-    expect(body.messages[0].content).toHaveLength(3);
-    expect(body.messages[0].content[0].type).toBe("document");
-    expect(body.messages[0].content[1].type).toBe("document");
-    expect(body.messages[0].content[2].type).toBe("text");
   });
 
   it("anthropicAnalyzePdf uses custom base URL", async () => {

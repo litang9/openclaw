@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import {
-  closeOpenClawAgentDatabasesForTest,
-  openOpenClawAgentDatabase,
-} from "../../state/openclaw-agent-db.js";
+import type { WorkerOptions } from "node:worker_threads";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { useSessionStoreTempDirs } from "../../test-utils/session-state-cleanup.js";
+import type { OpenClawConfig } from "../types.openclaw.js";
 import { readSessionArchiveContentSync } from "./archive-compression.js";
 import { isRetainedSessionTranscriptArchiveName } from "./artifacts.js";
+import { setCleanupDeleteFault } from "./cleanup-service.delete-fault.test-support.js";
 import { runSessionsCleanup } from "./cleanup-service.js";
 import {
   appendTranscriptEventSync,
@@ -20,7 +21,20 @@ import {
 import { prunePublishedSessionArchivesByRetention } from "./session-accessor.sqlite-archive-store.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+vi.mock("node:worker_threads", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:worker_threads")>();
+  const { withCleanupDeleteFault } = await import("./cleanup-service.delete-fault.test-support.js");
+  return {
+    ...actual,
+    Worker: class extends actual.Worker {
+      constructor(filename: string | URL, options?: WorkerOptions) {
+        super(filename, withCleanupDeleteFault(options));
+      }
+    },
+  };
+});
+
+const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-cleanup-fix-missing-");
 
 function listDeletedArchives(directory: string): string[] {
   if (!fs.existsSync(directory)) {
@@ -36,12 +50,40 @@ describe("sessions cleanup --fix-missing", () => {
   let storePath: string;
 
   beforeEach(() => {
-    const tempDir = tempDirs.make("openclaw-cleanup-fix-missing-");
+    const tempDir = sessionDirs.make();
     storePath = path.join(tempDir, "agents", "main", "sessions", "sessions.json");
   });
 
   afterEach(() => {
-    closeOpenClawAgentDatabasesForTest();
+    setCleanupDeleteFault(undefined);
+  });
+
+  it("inspects unscoped transcript keys in the selected agent's fixed-store partition", async () => {
+    await withOpenClawTestState({ layout: "state-only" }, async (state) => {
+      storePath = state.statePath("shared.json");
+      const cfg: OpenClawConfig = {
+        agents: { ownership: "explicit", entries: { main: {}, beta: {} } },
+        session: { store: storePath },
+      };
+      await state.writeConfig(cfg);
+      const main = { agentId: "main", sessionKey: "global", sessionId: "main-global", storePath };
+      const beta = { agentId: "beta", sessionKey: "global", sessionId: "beta-global", storePath };
+      for (const scope of [main, beta]) {
+        await replaceSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: Date.now() });
+      }
+      appendTranscriptMessageSync(beta, {
+        eventId: "beta-user-message",
+        message: { role: "user", content: [{ type: "text", text: "Keep this conversation." }] },
+      });
+
+      const result = await runSessionsCleanup({
+        cfg,
+        opts: { agent: "beta", dryRun: true, fixMissing: true },
+      });
+
+      expect(result.previewResults[0]?.summary).toMatchObject({ beforeCount: 1, missing: 0 });
+      expect(loadSessionEntry(beta)).toMatchObject({ sessionId: "beta-global" });
+    });
   });
 
   it("preserves readable session state when a later transcript row is malformed", async () => {
@@ -244,21 +286,18 @@ describe("sessions cleanup --fix-missing", () => {
     const sessionKey = "agent:main:rollback-delete";
     const sessionId = "rollback-delete";
     const scope = { sessionKey, sessionId, storePath };
-    await replaceSessionEntry(scope, { sessionId, updatedAt: Date.now() });
-    appendTranscriptEventSync(scope, { type: "proof", content: "must remain live" });
     const sqlitePath = resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" }).path;
     if (!sqlitePath) {
       throw new Error("expected SQLite session store");
     }
+    setCleanupDeleteFault({
+      databasePath: sqlitePath,
+      sessionId,
+      message: "injected lifecycle delete failure",
+    });
+    await replaceSessionEntry(scope, { sessionId, updatedAt: Date.now() });
+    appendTranscriptEventSync(scope, { type: "proof", content: "must remain live" });
     const database = openOpenClawAgentDatabase({ agentId: "main", path: sqlitePath });
-    database.db.exec(`
-      CREATE TRIGGER fail_session_window_delete
-      BEFORE DELETE ON session_windows
-      WHEN OLD.session_id = '${sessionId}'
-      BEGIN
-        SELECT RAISE(ABORT, 'injected lifecycle delete failure');
-      END;
-    `);
 
     await expect(
       runSessionsCleanup({

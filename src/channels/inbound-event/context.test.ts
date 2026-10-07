@@ -21,6 +21,7 @@ function createBaseContextParams(
     conversation: {
       kind: "group",
       id: "room-1",
+      routePeer: { kind: "group", id: "route-room-1" },
     },
     route: {
       agentId: "main",
@@ -108,6 +109,14 @@ describe("resolveInboundSupplementalSenderAllowed", () => {
 });
 
 describe("buildChannelInboundEventContext", () => {
+  it("does not claim authoritative route facts when the producer omits the route peer", () => {
+    const ctx = buildTestInboundEventContext({
+      conversation: { kind: "group", id: "room-1" },
+    });
+
+    expect(ctx.ConversationRouteContextObserved).toBeUndefined();
+  });
+
   it("maps normalized inbound facts into a finalized message context", async () => {
     const ctx = buildChannelInboundEventContext({
       channel: "test",
@@ -128,6 +137,7 @@ describe("buildChannelInboundEventContext", () => {
       conversation: {
         kind: "group",
         id: "room-1",
+        routePeer: { kind: "group", id: "route-room-1" },
         label: "Room One",
         spaceId: "workspace",
         threadId: "thread-1",
@@ -204,6 +214,8 @@ describe("buildChannelInboundEventContext", () => {
     });
 
     expect(ctx.InboundAccessAuthorized).toBe(true);
+    expect(ctx.ConversationRouteContextObserved).toBe(true);
+    expect(ctx.ConversationRoutePeerId).toBe("route-room-1");
 
     const expectedFields = {
       Body: "[User One] hello",
@@ -249,6 +261,7 @@ describe("buildChannelInboundEventContext", () => {
       SenderUsername: "userone",
       SenderTag: "User#0001",
       SenderIsBot: true,
+      SenderIsSelf: undefined,
       MemberRoleIds: ["admin"],
       Timestamp: 123,
       Provider: "test-provider",
@@ -297,6 +310,18 @@ describe("buildChannelInboundEventContext", () => {
     });
     expect(ctx.Body).not.toContain("customSenderField");
     expect(ctx.BodyForAgent).not.toContain("customSenderField");
+  });
+
+  it("projects the ingress from-me sender fact as SenderIsSelf", () => {
+    const ctx = buildTestInboundEventContext({
+      sender: {
+        id: "u1",
+        name: "User One",
+        isSelf: true,
+      },
+    });
+
+    expect(ctx.SenderIsSelf).toBe(true);
   });
 
   it("uses resolved command authorization", async () => {
@@ -761,7 +786,7 @@ describe("finalizeChannelInboundContext supplemental media resolution", () => {
     });
   });
 
-  it("suppresses self-authored quote body/media by default", async () => {
+  it("preserves self-authored quote text without loading its media by default", async () => {
     const media = vi.fn(async () => [{ path: "/tmp/reply.png", contentType: "image/png" }]);
     const result = await finalizeChannelInboundContext({
       context: {
@@ -790,7 +815,11 @@ describe("finalizeChannelInboundContext supplemental media resolution", () => {
     expect(result.context.media).toEqual([
       expect.objectContaining({ path: "/tmp/current.png", contentType: "image/png" }),
     ]);
-    expect(result.supplemental?.quote).toEqual({ id: "reply-1", sender: "Bot" });
+    expect(result.context).toMatchObject({
+      ReplyToId: "reply-1",
+      ReplyToBody: "previous bot reply",
+      ReplyToSender: "Bot",
+    });
   });
 
   it("preserves self-authored quote media when only the body is suppressed", async () => {
@@ -805,6 +834,7 @@ describe("finalizeChannelInboundContext supplemental media resolution", () => {
       },
       resolveSupplementalMedia: true,
       contextVisibility: "all",
+      suppressSelfQuoteBody: true,
       suppressSelfQuoteMedia: false,
       supplemental: {
         quote: {

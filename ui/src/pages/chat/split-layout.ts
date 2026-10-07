@@ -25,42 +25,18 @@ export function singlePaneLayout(
 
 const MIN_PAIR_SHARE = 0.15;
 
-export function splitWeight(weights: number[], index: number, context: string): number {
-  return expectDefined(weights[index], context);
-}
-
 export function splitRatio(weights: number[], index: number, context: string): number {
-  const before = splitWeight(weights, index, `${context} before divider`);
-  const after = splitWeight(weights, index + 1, `${context} after divider`);
+  const before = expectDefined(weights[index], `${context} before divider`);
+  const after = expectDefined(weights[index + 1], `${context} after divider`);
   return before / (before + after);
 }
 
-function cloneLayout(layout: ChatSplitLayout): ChatSplitLayout {
-  return {
-    columns: layout.columns.map((column) => ({
-      ...column,
-      panes: column.panes.map((pane) => ({ ...pane })),
-      paneWeights: [...column.paneWeights],
-    })),
-    columnWeights: [...layout.columnWeights],
-    activePaneId: layout.activePaneId,
-  };
-}
-
-function nextColumnId(layout: ChatSplitLayout): string {
-  const max = layout.columns.reduce(
-    (current, column) => Math.max(current, splitLayoutNumericSuffix(column.id, "c")),
+function nextSplitId(entries: readonly { id: string }[], prefix: "c" | "p"): string {
+  const max = entries.reduce(
+    (current, entry) => Math.max(current, splitLayoutNumericSuffix(entry.id, prefix)),
     0,
   );
-  return `c${max + 1}`;
-}
-
-function nextPaneId(layout: ChatSplitLayout): string {
-  const max = panesOf(layout).reduce(
-    (current, pane) => Math.max(current, splitLayoutNumericSuffix(pane.id, "p")),
-    0,
-  );
-  return `p${max + 1}`;
+  return `${prefix}${max + 1}`;
 }
 
 export function findPane(
@@ -69,31 +45,18 @@ export function findPane(
 ): { column: ChatSplitColumn; columnIndex: number; pane: ChatSplitPane; paneIndex: number } | null {
   for (const [columnIndex, column] of layout.columns.entries()) {
     const paneIndex = column.panes.findIndex((pane) => pane.id === paneId);
-    if (paneIndex >= 0) {
-      const selectedPane = column.panes[paneIndex];
-      if (!selectedPane) {
-        continue;
-      }
-      return {
-        column: {
-          ...column,
-          panes: column.panes.map((pane) => ({ ...pane })),
-          paneWeights: [...column.paneWeights],
-        },
-        columnIndex,
-        pane: { ...selectedPane },
-        paneIndex,
-      };
+    const pane = column.panes[paneIndex];
+    if (pane) {
+      return { column, columnIndex, pane, paneIndex };
     }
   }
   return null;
 }
 
 export function panesOf(layout: ChatSplitLayout): ChatSplitPane[] {
-  return layout.columns.flatMap((column) => column.panes.map((pane) => ({ ...pane })));
+  return layout.columns.flatMap((column) => column.panes);
 }
 
-/** Panes actually rendered at the current viewport width. */
 export function visiblePanesOf(layout: ChatSplitLayout, narrow: boolean): ChatSplitPane[] {
   if (!narrow) {
     return panesOf(layout);
@@ -108,12 +71,12 @@ export function insertPane(
   sessionKey: string,
   edge: ChatSplitEdge,
 ): ChatSplitLayout {
-  const location = findPane(layout, targetPaneId);
-  const next = cloneLayout(layout);
+  const next = structuredClone(layout);
+  const location = findPane(next, targetPaneId);
   if (!location) {
     return next;
   }
-  const newPaneId = nextPaneId(layout);
+  const newPaneId = nextSplitId(panesOf(layout), "p");
   if (edge === "left" || edge === "right") {
     const sourceWeight = expectDefined(
       next.columnWeights[location.columnIndex],
@@ -121,16 +84,13 @@ export function insertPane(
     );
     const insertIndex = location.columnIndex + (edge === "right" ? 1 : 0);
     next.columns.splice(insertIndex, 0, {
-      id: nextColumnId(layout),
+      id: nextSplitId(layout.columns, "c"),
       panes: [{ id: newPaneId, sessionKey }],
       paneWeights: [1],
     });
     next.columnWeights.splice(location.columnIndex, 1, sourceWeight / 2, sourceWeight / 2);
   } else {
-    const column = next.columns[location.columnIndex];
-    if (!column) {
-      return next;
-    }
+    const { column } = location;
     const sourceWeight = expectDefined(
       column.paneWeights[location.paneIndex],
       "split pane weight for located pane",
@@ -143,16 +103,17 @@ export function insertPane(
   return next;
 }
 
-export function closePane(layout: ChatSplitLayout, paneId: string): ChatSplitLayout | undefined {
-  const location = findPane(layout, paneId);
+export function closePane(
+  layout: ChatSplitLayout,
+  paneId: string,
+  keepSinglePaneIds?: ReadonlySet<string>,
+): ChatSplitLayout | undefined {
+  const next = structuredClone(layout);
+  const location = findPane(next, paneId);
   if (!location) {
-    return cloneLayout(layout);
-  }
-  const next = cloneLayout(layout);
-  const column = next.columns[location.columnIndex];
-  if (!column) {
     return next;
   }
+  const { column } = location;
   const activeWasClosed = next.activePaneId === paneId;
   let nextActivePaneId = next.activePaneId;
   if (activeWasClosed) {
@@ -170,7 +131,9 @@ export function closePane(layout: ChatSplitLayout, paneId: string): ChatSplitLay
   } else {
     column.paneWeights = normalizeSplitLayoutWeights(column.paneWeights);
   }
-  if (panesOf(next).length <= 1) {
+  const remaining = panesOf(next);
+  // An ownerless saved alias cannot fall back to the page's last confirmed route.
+  if (remaining.length <= 1 && !keepSinglePaneIds?.has(remaining[0]?.id ?? "")) {
     return undefined;
   }
   next.columnWeights = normalizeSplitLayoutWeights(next.columnWeights);
@@ -183,8 +146,8 @@ export function setPaneSession(
   paneId: string,
   sessionKey: string,
 ): ChatSplitLayout {
-  const next = cloneLayout(layout);
-  const pane = next.columns.flatMap((column) => column.panes).find((entry) => entry.id === paneId);
+  const next = structuredClone(layout);
+  const pane = findPane(next, paneId)?.pane;
   if (pane) {
     pane.sessionKey = sessionKey;
   }
@@ -192,20 +155,20 @@ export function setPaneSession(
 }
 
 export function setActivePane(layout: ChatSplitLayout, paneId: string): ChatSplitLayout {
-  const next = cloneLayout(layout);
-  if (panesOf(layout).some((pane) => pane.id === paneId)) {
+  const next = structuredClone(layout);
+  if (findPane(layout, paneId)) {
     next.activePaneId = paneId;
   }
   return next;
 }
 
-type UiSplitLayoutCommand = Extract<UiCommand, { kind: "split" | "close-pane" | "focus" }>;
+type UiSplitLayoutCommand = Extract<UiCommand, { kind: "split" | "focus" }>;
 
 export function applyUiCommandToSplitLayout(
   layout: ChatSplitLayout,
   command: UiSplitLayoutCommand,
   sourceSessionKey?: string,
-): ChatSplitLayout | undefined {
+): ChatSplitLayout {
   if (command.kind === "split") {
     const sourcePane = sourceSessionKey
       ? panesOf(layout).find((entry) => entry.sessionKey === sourceSessionKey)
@@ -224,9 +187,7 @@ export function applyUiCommandToSplitLayout(
   if (!pane) {
     return layout;
   }
-  return command.kind === "close-pane"
-    ? closePane(layout, pane.id)
-    : setActivePane(layout, pane.id);
+  return setActivePane(layout, pane.id);
 }
 
 function resizePair(weights: number[], boundaryIndex: number, pairRatio: number): number[] {
@@ -251,7 +212,7 @@ export function resizeColumns(
   boundaryIndex: number,
   pairRatio: number,
 ): ChatSplitLayout {
-  const next = cloneLayout(layout);
+  const next = structuredClone(layout);
   next.columnWeights = resizePair(next.columnWeights, boundaryIndex, pairRatio);
   return next;
 }
@@ -262,7 +223,7 @@ export function resizePanes(
   boundaryIndex: number,
   pairRatio: number,
 ): ChatSplitLayout {
-  const next = cloneLayout(layout);
+  const next = structuredClone(layout);
   const column = next.columns.find((entry) => entry.id === columnId);
   if (column) {
     column.paneWeights = resizePair(column.paneWeights, boundaryIndex, pairRatio);

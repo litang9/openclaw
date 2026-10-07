@@ -1,9 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  AUDIT_ACTIVITY_DIRECTIONS,
-  AUDIT_ACTIVITY_KINDS,
-  AUDIT_ACTIVITY_STATUSES,
-} from "../../packages/gateway-protocol/src/schema/audit-activity.js";
 import { runCommandWithRuntime } from "../cli/cli-utils.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { auditListCommand } from "./audit.js";
@@ -73,6 +68,8 @@ describe("audit command parsing", () => {
     { flag: "--after", options: { after: "-1" } },
     { flag: "--before", options: { before: "July 1, 2026" } },
     { flag: "--after", options: { after: "not-a-date" } },
+    { flag: "--after", options: { after: "" } },
+    { flag: "--before", options: { before: " \t" } },
   ])("rejects invalid $flag before calling the Gateway", async ({ flag, options }) => {
     await expect(auditListCommand(options, runtime)).rejects.toThrow(flag);
     expect(callGateway).not.toHaveBeenCalled();
@@ -112,6 +109,11 @@ describe("audit command parsing", () => {
 
     callGateway.mockClear();
     await expect(auditListCommand({ limit: "501" }, runtime)).rejects.toThrow("1 and 500");
+    expect(callGateway).not.toHaveBeenCalled();
+  });
+
+  it.each(["", " \t"])("rejects an explicit empty list limit %#", async (limit) => {
+    await expect(auditListCommand({ limit }, runtime)).rejects.toThrow("1 and 500");
     expect(callGateway).not.toHaveBeenCalled();
   });
 
@@ -156,20 +158,6 @@ describe("audit command parsing", () => {
     expect(runtime.error).toHaveBeenCalledWith(message);
     expect(runtime.exit).toHaveBeenCalledWith(1);
     expect(callGateway).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    ["kind", AUDIT_ACTIVITY_KINDS],
-    ["status", AUDIT_ACTIVITY_STATUSES],
-    ["direction", AUDIT_ACTIVITY_DIRECTIONS],
-  ] as const)("forwards every canonical %s value unchanged", async (filter, values) => {
-    for (const value of values) {
-      await auditListCommand({ [filter]: value }, runtime);
-      expect(callGateway).toHaveBeenLastCalledWith({
-        method: "audit.activity.list",
-        params: { limit: 100, [filter]: value },
-      });
-    }
   });
 
   it("renders activity safely without inventing message provenance", async () => {
@@ -415,7 +403,7 @@ describe("audit run explanation", () => {
         missingEvidence: ["run.record"],
         remediation: [],
       },
-      decisions: [],
+      decisionDisplays: [],
       coverage: { state: "unknown", missingEvidence: ["run.record"] },
     });
 
@@ -450,6 +438,13 @@ describe("audit run explanation", () => {
     callGateway.mockClear();
     await expect(
       auditListCommand({ explain: true, executionId: "execution-1", limit: "101" }, runtime),
+    ).rejects.toThrow("with --explain");
+    expect(callGateway).not.toHaveBeenCalled();
+  });
+
+  it.each(["", " \t"])("rejects an explicit empty decision limit %#", async (limit) => {
+    await expect(
+      auditListCommand({ explain: true, runId: "run-1", limit }, runtime),
     ).rejects.toThrow("with --explain");
     expect(callGateway).not.toHaveBeenCalled();
   });
@@ -497,13 +492,10 @@ describe("audit run explanation", () => {
           missingEvidence: ["invoker.principal"],
         },
       },
-      decisions: [
+      decisionDisplays: [
         {
           schemaVersion: 1,
-          receiptId: "context-1:admission",
-          contextId: "context-1",
-          executionId: "execution-1",
-          runId: "run-1",
+          selectorId: "context-1:admission",
           occurredAt: 1,
           action: { family: "run", operation: "admission" },
           decision: {
@@ -512,25 +504,17 @@ describe("audit run explanation", () => {
           },
           enforcement: {
             coverageState: "unattributed",
-            policyRefs: [],
-            grantRefs: [],
+            policyCount: 0,
+            grantCount: 0,
             contextFieldsUsed: [],
           },
-          source: {
-            owner: "agent-command",
-            recordRef: "context-1",
-            decisionBoundary: "agent-command.run-admission",
-          },
+          provenance: { state: "verified", producer: "run-admission" },
           missingEvidence: ["invoker.principal"],
           remediation: [{ code: "no_claim", text: "Treat this receipt as attribution only." }],
         },
         {
           schemaVersion: 1,
-          receiptId: "approval:receipt-1",
-          contextId: "context-1",
-          executionId: "execution-1",
-          runId: "run-1",
-          actionId: "receipt-1",
+          selectorId: "approval-decision:1",
           occurredAt: 2,
           action: { family: "exec", operation: "approval" },
           decision: {
@@ -539,41 +523,29 @@ describe("audit run explanation", () => {
           },
           enforcement: {
             coverageState: "enforced",
-            evaluatorRef: "operator-approval:device",
-            policyRefs: ["operator-approval:human-decision"],
-            grantRefs: [],
+            policyCount: 1,
+            grantCount: 0,
             contextFieldsUsed: ["contextId", "executionId", "runId"],
           },
-          source: {
-            owner: "operator_approvals",
-            recordRef: "receipt-1",
-            decisionBoundary: "gateway.operator-approval.first-answer",
-          },
+          provenance: { state: "verified", producer: "operator-approval" },
           missingEvidence: [],
           remediation: [{ code: "review_and_request_again", text: "Review the denial and retry." }],
         },
         {
           schemaVersion: 1,
-          receiptId: "fact-corrupt",
-          contextId: "context-1",
-          executionId: "execution-1",
-          runId: "run-1",
+          selectorId: "decision-fact:1",
           occurredAt: 3,
-          action: { family: "tool", operation: "decision" },
-          decision: { outcome: "unknown", reasonCode: "decision_fact_record_corrupt" },
+          action: { family: "decision", operation: "record" },
+          decision: { outcome: "unknown", reasonCode: "decision_fact_display_unverified" },
           enforcement: {
             coverageState: "unknown",
-            policyRefs: [],
-            grantRefs: [],
+            policyCount: 0,
+            grantCount: 0,
             contextFieldsUsed: [],
           },
-          source: {
-            owner: "tool-policy",
-            recordRef: "fact-corrupt",
-            decisionBoundary: "execution-decision-facts",
-          },
-          missingEvidence: ["decision.fact.valid"],
-          remediation: [{ code: "inspect_state_integrity", text: "Inspect state integrity." }],
+          provenance: { state: "unverified" },
+          missingEvidence: ["decision.display_provenance"],
+          remediation: [],
         },
       ],
       coverage: { state: "enforced", missingEvidence: ["invoker.principal"] },
@@ -617,10 +589,20 @@ describe("audit run explanation", () => {
     expect(output).toContain("operator_approval_denied_by_reviewer");
     expect(output).toContain("authoritative owner-native SQLite record; retained 30 days");
     expect(output).toContain("admission provenance only; no enforcement decision");
-    expect(output).toContain("evidence unavailable or corrupt; do not infer authorization");
     expect(output).not.toContain("named authoritative decision source");
-    expect(output).toContain("Policy refs: operator-approval:human-decision");
+    expect(output).toContain("Policy refs: 1");
+    expect(output).toContain("Policy refs: 0");
+    expect(output).toContain("Grant refs: 0");
     expect(output).toContain("Context used: contextId, executionId, runId");
+    expect(output).toContain("producer display contract unverified; receipt prose omitted");
+    vi.mocked(runtime.log).mockClear();
+    await auditListCommand({ explain: true, runId: "run-1", json: true }, runtime);
+    const jsonOutput = vi.mocked(runtime.log).mock.calls.flat().join("\n");
+    expect(jsonOutput).toContain('"decisionDisplays"');
+    expect(jsonOutput).not.toContain('"decisions"');
+    for (const rawKey of ["receiptId", "resolutionRef", "eventId"]) {
+      expect(jsonOutput).not.toContain(`"${rawKey}"`);
+    }
   });
 
   it("renders ambiguous run discovery and selects an exact execution", async () => {
@@ -642,7 +624,7 @@ describe("audit run explanation", () => {
           },
         ],
       },
-      decisions: [],
+      decisionDisplays: [],
       coverage: { state: "unknown", missingEvidence: ["execution.selection"] },
     });
 
@@ -661,7 +643,7 @@ describe("audit run explanation", () => {
         missingEvidence: ["identity.context"],
         remediation: [{ code: "verify_execution_id", text: "Verify the exact execution id." }],
       },
-      decisions: [],
+      decisionDisplays: [],
       coverage: { state: "unknown", missingEvidence: ["identity.context"] },
     });
     await auditListCommand({ explain: true, executionId: "execution-2", json: true }, runtime);
@@ -681,7 +663,7 @@ describe("audit run explanation", () => {
         missingEvidence: ["identity.context"],
         remediation: [],
       },
-      decisions: [],
+      decisionDisplays: [],
       coverage: { state: "unknown", missingEvidence: ["identity.context"] },
     });
 
@@ -730,7 +712,7 @@ describe("audit run explanation", () => {
           },
         ],
       },
-      decisions: [],
+      decisionDisplays: [],
       coverage: { state: "unsupported", missingEvidence: ["identity.context"] },
     });
 

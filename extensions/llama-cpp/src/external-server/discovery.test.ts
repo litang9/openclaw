@@ -1,349 +1,178 @@
-import type { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
-import { describe, expect, it, vi } from "vitest";
+import { withServer } from "openclaw/plugin-sdk/test-env";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { discoverLlamaServer } from "./discovery.js";
 
-type LlamaServerFetchGuard = typeof fetchWithSsrFGuard;
-type DiscoveryParams = Parameters<typeof discoverLlamaServer>[0];
+const discoverRowsMock = vi.hoisted(() => vi.fn());
 
-async function discoverTest(params: DiscoveryParams) {
-  return await discoverLlamaServer({ cacheTtlMs: 0, ...params });
-}
+vi.mock("openclaw/plugin-sdk/provider-setup", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/provider-setup")>()),
+  discoverOpenAICompatibleLocalModels: discoverRowsMock,
+}));
 
-type RouteValue = Response | Error | (() => Response | Promise<Response>);
-
-function createFetchGuard(routes: Record<string, RouteValue>) {
-  const requests: string[] = [];
-  const guard = vi.fn(async (params: Parameters<LlamaServerFetchGuard>[0]) => {
-    requests.push(params.url);
-    const route = routes[params.url];
-    if (!route) {
-      throw new Error(`unexpected request: ${params.url}`);
-    }
-    if (route instanceof Error) {
-      throw route;
-    }
-    const response = typeof route === "function" ? await route() : route;
-    return {
-      response,
-      finalUrl: params.url,
-      release: async () => undefined,
-    };
-  }) as unknown as LlamaServerFetchGuard;
-  return { guard, requests };
-}
-
-function json(value: unknown, status = 200): Response {
-  return new Response(JSON.stringify(value), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-describe("llama-server discovery", () => {
-  it("discovers a single model and reads runtime properties", async () => {
-    const { guard, requests } = createFetchGuard({
-      "http://localhost:8080/health": json({ status: "ok" }),
-      "http://localhost:8080/models": json({
-        object: "list",
-        data: [{ id: "qwen/model:Q4_K_M", object: "model", owned_by: "llamacpp" }],
-      }),
-      "http://localhost:8080/props": json({
-        default_generation_settings: { n_ctx: 32768 },
-        chat_template_caps: { supports_tools: true, supports_tool_calls: true },
-      }),
-    });
-
-    const result = await discoverTest({
-      baseUrl: "http://localhost:8080/v1",
-      apiKey: "server-key",
-      fetchGuard: guard,
-      cacheTtlMs: 0,
-    });
-
-    expect(result).toMatchObject({
-      kind: "success",
-      health: "ready",
-      models: [
-        {
-          status: "unknown",
-          config: {
-            id: "qwen/model:Q4_K_M",
-            contextWindow: 32768,
-            compat: { supportsTools: true },
-          },
-        },
-      ],
-    });
-    expect(requests).toEqual([
-      "http://localhost:8080/health",
-      "http://localhost:8080/models",
-      "http://localhost:8080/props",
-    ]);
-    expect(guard).toHaveBeenCalledWith(
-      expect.objectContaining({
-        init: {
-          headers: {
-            Accept: "application/json",
-            Authorization: "Bearer server-key",
-          },
-        },
-      }),
-    );
+describe("llama-server discovery projection", () => {
+  beforeEach(() => {
+    discoverRowsMock.mockReset();
   });
 
-  it("lists router models without loading an unloaded model", async () => {
-    const { guard, requests } = createFetchGuard({
-      "http://localhost:8080/health": json({ status: "ok" }),
-      "http://localhost:8080/models": json({
-        data: [
-          { id: "loaded/model", object: "model", status: { value: "loaded" } },
-          { id: "sleeping:model", object: "model", status: { value: "sleeping" } },
-          { id: "unloaded/model", object: "model", status: { value: "unloaded" } },
-        ],
-      }),
-      "http://localhost:8080/props?model=loaded%2Fmodel&autoload=false": json({
-        default_generation_settings: { n_ctx: 16384 },
-      }),
-      "http://localhost:8080/props?model=sleeping%3Amodel&autoload=false": json({
-        default_generation_settings: { n_ctx: 8192 },
-        is_sleeping: true,
-      }),
-    });
-
-    const result = await discoverTest({
-      baseUrl: "http://localhost:8080",
-      fetchGuard: guard,
-      cacheTtlMs: 0,
-    });
-
-    expect(result.kind).toBe("success");
-    if (result.kind !== "success") {
-      throw new Error("expected successful discovery");
-    }
-    expect(result.models.map((model) => [model.config.id, model.status])).toEqual([
-      ["loaded/model", "loaded"],
-      ["sleeping:model", "sleeping"],
-      ["unloaded/model", "unloaded"],
-    ]);
-    expect(requests).not.toContain(
-      "http://localhost:8080/props?model=unloaded%2Fmodel&autoload=false",
-    );
-    expect(requests.every((url) => !url.includes("reload=1"))).toBe(true);
-  });
-
-  it("bounds concurrent router property probes", async () => {
-    const rows = Array.from({ length: 17 }, (_, index) => ({
-      id: `loaded/model-${index}`,
-      object: "model",
-      status: { value: "loaded" },
-    }));
-    let active = 0;
-    let maximumActive = 0;
-    const routes: Record<string, RouteValue> = {
-      "http://localhost:8080/health": json({ status: "ok" }),
-      "http://localhost:8080/models": json({ data: rows }),
-    };
-    for (const row of rows) {
-      routes[`http://localhost:8080/props?model=${encodeURIComponent(row.id)}&autoload=false`] =
-        async () => {
-          active += 1;
-          maximumActive = Math.max(maximumActive, active);
-          await new Promise((resolve) => {
-            setTimeout(resolve, 5);
-          });
-          active -= 1;
-          return json({ default_generation_settings: { n_ctx: 8192 } });
-        };
-    }
-    const { guard } = createFetchGuard(routes);
-
-    const result = await discoverTest({
-      baseUrl: "http://localhost:8080",
-      fetchGuard: guard,
-      cacheTtlMs: 0,
-    });
-
-    expect(result).toMatchObject({ kind: "success", models: expect.any(Array) });
-    expect(result.kind === "success" ? result.models : []).toHaveLength(17);
-    expect(maximumActive).toBeGreaterThan(1);
-    expect(maximumActive).toBeLessThanOrEqual(8);
-  });
-
-  it("stops scheduling router property probes after the total budget", async () => {
-    const rows = Array.from({ length: 17 }, (_, index) => ({
-      id: `loaded/model-${index}`,
-      object: "model",
-      status: { value: "loaded" },
-    }));
-    const routes: Record<string, RouteValue> = {
-      "http://localhost:8080/health": json({ status: "ok" }),
-      "http://localhost:8080/models": json({ data: rows }),
-    };
-    for (const row of rows) {
-      routes[`http://localhost:8080/props?model=${encodeURIComponent(row.id)}&autoload=false`] =
-        async () => {
-          await new Promise((resolve) => {
-            setTimeout(resolve, 20);
-          });
-          return json({ default_generation_settings: { n_ctx: 8192 } });
-        };
-    }
-    const { guard, requests } = createFetchGuard(routes);
-
-    const result = await discoverTest({
-      baseUrl: "http://localhost:8080",
-      fetchGuard: guard,
-      cacheTtlMs: 0,
-      timeoutMs: 10,
-    });
-
-    expect(result.kind === "success" ? result.models : []).toHaveLength(17);
-    expect(requests.filter((url) => url.includes("/props?"))).toHaveLength(8);
-  });
-
-  it("falls back to /v1/models for an older compatible server", async () => {
-    const { guard } = createFetchGuard({
-      "http://localhost:8080/health": json({ status: "ok" }),
-      "http://localhost:8080/models": json({ error: "missing" }, 404),
-      "http://localhost:8080/v1/models": json({
-        data: [{ id: "model", object: "model" }],
-      }),
-      "http://localhost:8080/props": json({}),
-    });
-
-    await expect(
-      discoverLlamaServer({ baseUrl: "http://localhost:8080", fetchGuard: guard, cacheTtlMs: 0 }),
-    ).resolves.toMatchObject({ kind: "success", models: [{ config: { id: "model" } }] });
-  });
-
-  it("keeps a loading health state while listing available models", async () => {
-    const { guard } = createFetchGuard({
-      "http://localhost:8080/health": json({ error: "loading" }, 503),
-      "http://localhost:8080/models": json({ data: [] }),
-    });
-
-    await expect(
-      discoverLlamaServer({ baseUrl: "http://localhost:8080", fetchGuard: guard, cacheTtlMs: 0 }),
-    ).resolves.toMatchObject({ kind: "success", health: "loading", models: [] });
-  });
-
-  it("separates transport, HTTP, and malformed-response failures", async () => {
-    const unreachable = createFetchGuard({
-      "http://localhost:8080/health": new Error("connection refused"),
-    });
-    await expect(
-      discoverLlamaServer({
-        baseUrl: "http://localhost:8080",
-        fetchGuard: unreachable.guard,
-        cacheTtlMs: 0,
-      }),
-    ).resolves.toMatchObject({ kind: "unreachable" });
-
-    const unauthorized = createFetchGuard({
-      "http://localhost:8080/health": json({ error: "unauthorized" }, 401),
-    });
-    await expect(
-      discoverLlamaServer({
-        baseUrl: "http://localhost:8080",
-        fetchGuard: unauthorized.guard,
-        cacheTtlMs: 0,
-      }),
-    ).resolves.toMatchObject({ kind: "http-error", status: 401, path: "/health" });
-
-    const malformed = createFetchGuard({
-      "http://localhost:8080/health": json({ status: "ok" }),
-      "http://localhost:8080/models": new Response("{", { status: 200 }),
-    });
-    await expect(
-      discoverLlamaServer({
-        baseUrl: "http://localhost:8080",
-        fetchGuard: malformed.guard,
-        cacheTtlMs: 0,
-      }),
-    ).resolves.toMatchObject({ kind: "invalid-response", path: "/models" });
-  });
-
-  it("forwards configured headers and bypasses the shared cache for credentialed discovery", async () => {
-    const { guard } = createFetchGuard({
-      "http://localhost:8080/health": () => json({ status: "ok" }),
-      "http://localhost:8080/models": () => json({ data: [] }),
-    });
-
-    for (let index = 0; index < 2; index += 1) {
-      await discoverTest({
-        baseUrl: "http://localhost:8080",
-        headers: { "X-Proxy-Key": "proxy-token" },
-        fetchGuard: guard,
-      });
-    }
-
-    expect(guard).toHaveBeenCalledTimes(4);
-    for (const call of vi.mocked(guard).mock.calls) {
-      expect(call[0]).toEqual(
-        expect.objectContaining({
-          init: {
-            headers: {
-              Accept: "application/json",
-              "X-Proxy-Key": "proxy-token",
+  it.each([
+    {
+      name: "advertised reasoning effort",
+      caps: { supports_reasoning_effort: true },
+      reasoning: true,
+    },
+    {
+      name: "unsupported reasoning effort",
+      caps: { supports_reasoning_effort: false },
+      reasoning: false,
+    },
+    { name: "absent reasoning effort", caps: {}, reasoning: false },
+  ])(
+    "projects shared model rows and llama.cpp properties with $name",
+    async ({ caps, reasoning }) => {
+      discoverRowsMock.mockResolvedValue({
+        kind: "success",
+        health: "loading",
+        fetchedAt: 123,
+        rows: [
+          {
+            model: {
+              id: "qwen/model:Q4_K_M",
+              object: "model",
+              status: { value: "sleeping" },
+            },
+            props: {
+              default_generation_settings: { n_ctx: 32_768 },
+              chat_template_caps: { ...caps, supports_tools: true, supports_tool_calls: true },
             },
           },
-        }),
-      );
-    }
-  });
-
-  it("reuses only successful cached discovery", async () => {
-    const { guard } = createFetchGuard({
-      "http://localhost:8080/health": json({ status: "ok" }),
-      "http://localhost:8080/models": json({ data: [] }),
-    });
-
-    await discoverTest({
-      baseUrl: "http://localhost:8080",
-      apiKey: "custom-local",
-      fetchGuard: guard,
-      cacheTtlMs: 30_000,
-    });
-    await discoverTest({
-      baseUrl: "http://localhost:8080",
-      apiKey: "custom-local",
-      fetchGuard: guard,
-      cacheTtlMs: 30_000,
-    });
-    expect(guard).toHaveBeenCalledTimes(2);
-  });
-
-  it("bounds cached endpoint discovery", async () => {
-    const guard = vi.fn(async (params: Parameters<LlamaServerFetchGuard>[0]) => ({
-      response: params.url.endsWith("/health") ? json({ status: "ok" }) : json({ data: [] }),
-      finalUrl: params.url,
-      release: async () => undefined,
-    })) as unknown as LlamaServerFetchGuard;
-
-    for (let index = 0; index <= 100; index += 1) {
-      await discoverTest({
-        baseUrl: `http://localhost:${10_000 + index}`,
-        apiKey: "custom-local",
-        fetchGuard: guard,
-        cacheTtlMs: 30_000,
+        ],
       });
-    }
-    expect(guard).toHaveBeenCalledTimes(202);
 
-    await discoverTest({
-      baseUrl: "http://localhost:10100",
-      apiKey: "custom-local",
-      fetchGuard: guard,
-      cacheTtlMs: 30_000,
-    });
-    expect(guard).toHaveBeenCalledTimes(202);
+      await expect(
+        discoverLlamaServer({ baseUrl: "http://localhost:8080/v1" }),
+      ).resolves.toMatchObject({
+        kind: "success",
+        endpoint: {
+          origin: "http://localhost:8080",
+          inferenceBaseUrl: "http://localhost:8080/v1",
+        },
+        models: [
+          {
+            status: "sleeping",
+            config: {
+              id: "qwen/model:Q4_K_M",
+              reasoning,
+              contextWindow: 32_768,
+              compat: { supportsTools: true, supportsReasoningEffort: reasoning },
+            },
+          },
+        ],
+      });
+      expect(discoverRowsMock).toHaveBeenCalledWith({
+        baseUrl: "http://localhost:8080/v1",
+        serverBaseUrl: "http://localhost:8080",
+        apiKey: undefined,
+        headers: undefined,
+        label: "llama-server",
+        healthPath: "/health",
+        modelsPathOrder: "server-first",
+        routerModelProps: true,
+        timeoutMs: 5_000,
+        signal: undefined,
+        rawResult: true,
+      });
+    },
+  );
 
-    await discoverTest({
-      baseUrl: "http://localhost:10000",
-      apiKey: "custom-local",
-      fetchGuard: guard,
-      cacheTtlMs: 30_000,
+  it("attaches the normalized endpoint to shared discovery failures", async () => {
+    discoverRowsMock.mockResolvedValue({
+      kind: "invalid-response",
+      path: "/models",
+      error: new Error("malformed"),
     });
-    expect(guard).toHaveBeenCalledTimes(204);
+
+    await expect(discoverLlamaServer({ baseUrl: "localhost:8080" })).resolves.toMatchObject({
+      kind: "invalid-response",
+      path: "/models",
+      endpoint: {
+        origin: "http://localhost:8080",
+        inferenceBaseUrl: "http://localhost:8080/v1",
+      },
+    });
+  });
+
+  it.each([
+    { name: "HTML app shell", body: "<!doctype html><html><body>Local model app</body></html>" },
+    { name: "non-model JSON", body: JSON.stringify({ app: "local-models" }) },
+  ])("discovers an existing server behind a root $name response", async ({ body }) => {
+    const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/provider-setup")>(
+      "openclaw/plugin-sdk/provider-setup",
+    );
+    discoverRowsMock.mockImplementation(actual.discoverOpenAICompatibleLocalModels);
+    const requests: string[] = [];
+    await withServer(
+      (request, response) => {
+        requests.push(request.url ?? "");
+        if (request.url === "/models") {
+          response.end(body);
+        } else if (request.url === "/v1/models") {
+          response.setHeader("Content-Type", "application/json");
+          response.end(JSON.stringify({ data: [{ id: "local-model", object: "model" }] }));
+        } else {
+          response.end("{}");
+        }
+      },
+      async (baseUrl) => {
+        await expect(discoverLlamaServer({ baseUrl })).resolves.toMatchObject({
+          kind: "success",
+          models: [{ config: { id: "local-model" } }],
+        });
+        expect(requests).toEqual(["/health", "/models", "/v1/models", "/props"]);
+      },
+    );
+  });
+
+  it.each([
+    { name: "API key", access: { apiKey: "endpoint-key" } },
+    { name: "authorization header", access: { headers: { Authorization: "Bearer endpoint-key" } } },
+    { name: "anonymous access", access: {} },
+  ])("fetches fresh discovery for $name and subsequent anonymous requests", async ({ access }) => {
+    const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/provider-setup")>(
+      "openclaw/plugin-sdk/provider-setup",
+    );
+    discoverRowsMock.mockImplementation(actual.discoverOpenAICompatibleLocalModels);
+    let modelId = "anonymous-model";
+    const modelRequests: Array<string | undefined> = [];
+    await withServer(
+      (request, response) => {
+        response.setHeader("Content-Type", "application/json");
+        if (request.url === "/models") {
+          modelRequests.push(request.headers.authorization);
+          response.end(JSON.stringify({ data: [{ id: modelId, status: { value: "unloaded" } }] }));
+        } else {
+          response.end("{}");
+        }
+      },
+      async (baseUrl) => {
+        await expect(discoverLlamaServer({ baseUrl })).resolves.toMatchObject({
+          kind: "success",
+          models: [{ config: { id: "anonymous-model" } }],
+        });
+        modelId = "fresh-model";
+        await expect(discoverLlamaServer({ baseUrl, ...access })).resolves.toMatchObject({
+          kind: "success",
+          models: [{ config: { id: "fresh-model" } }],
+        });
+        await expect(discoverLlamaServer({ baseUrl })).resolves.toMatchObject({
+          kind: "success",
+          models: [{ config: { id: "fresh-model" } }],
+        });
+        expect(modelRequests).toEqual([
+          undefined,
+          "apiKey" in access || "headers" in access ? "Bearer endpoint-key" : undefined,
+          undefined,
+        ]);
+      },
+    );
   });
 });

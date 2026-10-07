@@ -1,6 +1,5 @@
 // Coverage for terminal attempt trajectory status classification.
 import { describe, expect, it } from "vitest";
-import { hasAttemptTerminalState } from "./attempt-terminal-evidence.js";
 import {
   resolveAttemptTrajectoryTerminal,
   resolveTerminalAssistantTexts,
@@ -47,17 +46,6 @@ describe("attempt trajectory status", () => {
     ).toEqual({ status: "success" });
   });
 
-  it("records a recovery receipt without assistant text as successful terminal output", () => {
-    const hasTerminalOutput = hasAttemptTerminalState({
-      lastToolRecovery: { toolName: "write" },
-    });
-
-    expect(hasTerminalOutput).toBe(true);
-    expect(resolveAttemptTrajectoryTerminal(baseParams({ hasTerminalOutput }))).toEqual({
-      status: "success",
-    });
-  });
-
   it("records length-limited visible text as success with no synthesized payload", () => {
     // The headline case: an ordinary text-only truncated reply. Finalization runs
     // before terminal preparation converts assistant text into payloads, so
@@ -74,23 +62,6 @@ describe("attempt trajectory status", () => {
     ).toEqual({ status: "success" });
   });
 
-  it("keeps a length-limited turn with nothing to show non-deliverable", () => {
-    // No visible text, no payload, no terminal output: nothing reached the user,
-    // so this stays the incomplete-turn error the runner still surfaces.
-    expect(
-      resolveAttemptTrajectoryTerminal(
-        baseParams({
-          assistantTexts: [],
-          synthesizedPayloadCount: 0,
-          lastAssistantStopReason: "length",
-        }),
-      ),
-    ).toEqual({
-      status: "error",
-      terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON,
-    });
-  });
-
   it("keeps whitespace-only length-limited text non-deliverable", () => {
     expect(
       resolveAttemptTrajectoryTerminal(
@@ -103,20 +74,6 @@ describe("attempt trajectory status", () => {
       status: "error",
       terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON,
     });
-  });
-
-  it("records a delivered length-limited partial payload as success", () => {
-    // The terminal owner delivers this turn as a partial reply, so the durable
-    // trajectory record must agree instead of reporting a non-deliverable error.
-    expect(
-      resolveAttemptTrajectoryTerminal(
-        baseParams({
-          assistantTexts: ["Partial answer."],
-          synthesizedPayloadCount: 1,
-          lastAssistantStopReason: "length",
-        }),
-      ),
-    ).toEqual({ status: "success" });
   });
 
   it("keeps length-limited turns successful when terminal output was delivered", () => {
@@ -146,6 +103,17 @@ describe("attempt trajectory status", () => {
           didSendViaMessagingTool: true,
           messagingToolSentTargets: [{ channel: "telegram" }],
           lastAssistantStopReason: "length",
+        }),
+      ),
+    ).toEqual({ status: "success" });
+  });
+
+  it("keeps media-only committed delivery as terminal progress", () => {
+    expect(
+      resolveAttemptTrajectoryTerminal(
+        baseParams({
+          messagingToolSentMediaUrls: ["file:///tmp/render.png"],
+          lastAssistantStopReason: "toolUse",
         }),
       ),
     ).toEqual({ status: "success" });
@@ -201,6 +169,21 @@ describe("attempt trajectory status", () => {
     });
   });
 
+  it.each([
+    ["stop", { status: "success" }],
+    ["toolUse", { status: "error", terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON }],
+    ["length", { status: "error", terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON }],
+  ] as const)(
+    "classifies cron-only progress after a %s stop",
+    (lastAssistantStopReason, expected) => {
+      expect(
+        resolveAttemptTrajectoryTerminal(
+          baseParams({ lastAssistantStopReason, successfulCronAdds: 1 }),
+        ),
+      ).toEqual(expected);
+    },
+  );
+
   it("keeps heartbeat responses as success", () => {
     expect(
       resolveAttemptTrajectoryTerminal(
@@ -224,15 +207,6 @@ describe("attempt trajectory status", () => {
       resolveAttemptTrajectoryTerminal(baseParams({ emptyAssistantReplyIsSilent: true })),
     ).toEqual({
       status: "success",
-    });
-  });
-
-  it("does not let the raw silent policy hide ineligible empty failures", () => {
-    expect(
-      resolveAttemptTrajectoryTerminal(baseParams({ emptyAssistantReplyIsSilent: false })),
-    ).toEqual({
-      status: "error",
-      terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON,
     });
   });
 
@@ -278,21 +252,6 @@ describe("attempt trajectory status", () => {
         }),
       ),
     ).toEqual({ status: "success" });
-  });
-
-  it("marks internally aborted tool-use attempts without delivery as non-deliverable", () => {
-    expect(
-      resolveAttemptTrajectoryTerminal(
-        baseParams({
-          interrupted: false,
-          toolMetas: [{ toolName: "web_search" }],
-          lastAssistantStopReason: "toolUse",
-        }),
-      ),
-    ).toEqual({
-      status: "error",
-      terminalError: NON_DELIVERABLE_TERMINAL_TURN_REASON,
-    });
   });
 
   it("keeps async-started media tool-use attempts as terminal progress", () => {

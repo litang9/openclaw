@@ -1,4 +1,3 @@
-// ClickClack fixture server for release user-journey E2E scenarios.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -44,6 +43,7 @@ const messages = [];
 const threadReplies = [];
 const outboundMessages = [];
 const sockets = new Set();
+let socketGeneration = 0;
 
 function persist() {
   fs.writeFileSync(
@@ -54,6 +54,7 @@ function persist() {
         threadReplies,
         outboundMessages,
         socketCount: sockets.size,
+        socketGeneration,
       },
       null,
       2,
@@ -70,16 +71,12 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function unauthorized(res) {
-  json(res, 401, { error: "unauthorized" });
-}
-
 function checkAuth(req, res) {
   if (req.url?.startsWith("/fixture/") || req.url === "/health") {
     return true;
   }
   if (req.headers.authorization !== `Bearer ${token}`) {
-    unauthorized(res);
+    json(res, 401, { error: "unauthorized" });
     return false;
   }
   return true;
@@ -100,7 +97,12 @@ function readBody(req) {
         settled = true;
         body = "";
         req.resume();
-        reject(requestBodyTooLargeError());
+        reject(
+          Object.assign(
+            new Error(`ClickClack fixture request body exceeded ${requestMaxBytes} bytes`),
+            { code: "ETOOBIG" },
+          ),
+        );
         return;
       }
       body += chunk;
@@ -125,25 +127,12 @@ function readBody(req) {
   });
 }
 
-function requestBodyTooLargeError() {
-  return Object.assign(
-    new Error(`ClickClack fixture request body exceeded ${requestMaxBytes} bytes`),
-    {
-      code: "ETOOBIG",
-    },
-  );
-}
-
-function isRequestBodyTooLargeError(error) {
-  return error instanceof Error && error.code === "ETOOBIG";
-}
-
 function handleRequestError(res, error) {
   if (res.headersSent) {
     res.destroy();
     return;
   }
-  if (isRequestBodyTooLargeError(error)) {
+  if (error instanceof Error && error.code === "ETOOBIG") {
     json(res, 413, { error: error.message });
     return;
   }
@@ -245,7 +234,7 @@ async function handleRequest(req, res) {
     if (req.method === "GET" && url.pathname === `/api/channels/${channel.id}/messages`) {
       const afterSeq = Number(url.searchParams.get("after_seq") ?? 0);
       json(res, 200, {
-        messages: messages.filter((message) => (message.channel_seq ?? 0) > afterSeq),
+        messages: messages.filter((message) => message.channel_seq > afterSeq),
       });
       return;
     }
@@ -289,7 +278,13 @@ async function handleRequest(req, res) {
       return;
     }
     if (req.method === "GET" && url.pathname === "/fixture/state") {
-      json(res, 200, { messages, threadReplies, outboundMessages, socketCount: sockets.size });
+      json(res, 200, {
+        messages,
+        threadReplies,
+        outboundMessages,
+        socketCount: sockets.size,
+        socketGeneration,
+      });
       return;
     }
     json(res, 404, { error: `unhandled ${req.method} ${url.pathname}` });
@@ -328,15 +323,20 @@ server.on("upgrade", (req, socket) => {
     ].join("\r\n"),
   );
   sockets.add(socket);
+  socketGeneration += 1;
   persist();
-  socket.on("close", () => {
-    sockets.delete(socket);
-    persist();
+  const cleanupSocket = () => {
+    if (sockets.delete(socket)) {
+      persist();
+    }
+  };
+  socket.on("close", cleanupSocket);
+  socket.on("end", () => {
+    cleanupSocket();
+    socket.end();
   });
-  socket.on("error", () => {
-    sockets.delete(socket);
-    persist();
-  });
+  socket.on("error", cleanupSocket);
+  socket.resume();
 });
 
 persist();
