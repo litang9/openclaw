@@ -122,7 +122,7 @@ function parseKimiUsageWindows(payload: unknown): UsageWindow[] {
       if (ratio === undefined) {
         return [];
       }
-      const resetAt = typeof row.reset_time === "string" ? Date.parse(row.reset_time) : NaN;
+      const resetAt = typeof row.reset_time === "string" ? Date.parse(row.reset_time) : Number.NaN;
       return [
         {
           label,
