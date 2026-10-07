@@ -54,24 +54,20 @@ const mocks = vi.hoisted(() => ({
   removeModelAuthCredentials: vi.fn(async () => {}),
   saveModelProviderApiKey:
     vi.fn<typeof import("../../commands/models/auth-api-key.js").saveModelProviderApiKey>(),
-  setAuthProfileOrder: vi.fn(
-    async (): Promise<AuthProfileStore | null> => ({
-      version: 1,
-      profiles: {},
-    }),
-  ),
+  setAuthProfileOrder: vi.fn(async (): Promise<AuthProfileStore | null> => ({
+    version: 1,
+    profiles: {},
+  })),
   refreshActiveProviderAuthRuntimeSnapshot: vi.fn(async () => false),
   prepareModelRuntimeSnapshot: vi.fn(async () => {}),
   loadDeferredCatalog: vi.fn(),
   readPreparedCatalog: vi.fn(),
-  buildAuthHealthSummary: vi.fn<BuildAuthHealthSummary>(
-    (): AuthHealthSummary => ({
-      now: 0,
-      warnAfterMs: 0,
-      profiles: [],
-      providers: [],
-    }),
-  ),
+  buildAuthHealthSummary: vi.fn<BuildAuthHealthSummary>((): AuthHealthSummary => ({
+    now: 0,
+    warnAfterMs: 0,
+    profiles: [],
+    providers: [],
+  })),
   loadProviderUsageSummary: vi.fn(async (): Promise<UsageSummary> => emptyUsageSummary()),
   listProviderUsagePluginDescriptors: vi.fn(() => [
     { provider: "anthropic", displayName: "Claude" },

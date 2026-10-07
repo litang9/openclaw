@@ -33,13 +33,22 @@ vi.mock("../plugins/loader-runtime-load.js", async (importOriginal) => {
 import { createUsageModelBaseUrlResolver } from "./provider-usage.models.js";
 
 describe("credential-free usage route preparation", () => {
-  it.each([false, true])(
-    "uses the real cold owner with a non-Kimi primary (authored proxy: %s)",
-    async (custom) => {
+  it.each(["none", "alias", "provider", "model"] as const)(
+    "uses the real cold owner with a non-Kimi primary (proxy override: %s)",
+    async (override) => {
       await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
         auth.ambient.mockClear();
         auth.store.mockClear();
         const agentDir = state.agentDir();
+        const testModel = {
+          id: "test-model",
+          name: "Test",
+          reasoning: false,
+          input: ["text" as const],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 1000,
+          maxTokens: 100,
+        };
         const config: OpenClawConfig = {
           agents: { defaults: { model: "test-provider/test-model" }, entries: { main: {} } },
           plugins: { allow: ["kimi"], slots: { memory: "none" } },
@@ -48,31 +57,46 @@ describe("credential-free usage route preparation", () => {
               "test-provider": {
                 baseUrl: "https://other.example.test/v1",
                 api: "openai-completions",
-                models: [
-                  {
-                    id: "test-model",
-                    name: "Test",
-                    reasoning: false,
-                    input: ["text"],
-                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                    contextWindow: 1000,
-                    maxTokens: 100,
-                  },
-                ],
+                models: [testModel],
               },
             },
           },
         };
-        if (custom) {
+        if (override === "provider" || override === "model") {
+          config.models = {
+            providers: {
+              ...config.models?.providers,
+              kimi: {
+                baseUrl: "https://api.kimi.com/coding/",
+                api: "anthropic-messages",
+                models: [
+                  {
+                    ...testModel,
+                    id: "kimi-for-coding",
+                    ...(override === "model"
+                      ? { baseUrl: "https://proxy.example.test/coding/" }
+                      : {}),
+                  },
+                ],
+              },
+            },
+          };
+        }
+        if (override === "alias" || override === "provider") {
           await fs.mkdir(agentDir, { recursive: true });
           await fs.writeFile(
             path.join(agentDir, "models.json"),
             JSON.stringify({
               providers: {
-                "kimi-coding": {
+                [override === "alias" ? "kimi-coding" : "kimi"]: {
                   baseUrl: "https://proxy.example.test/coding/",
                   api: "anthropic-messages",
-                  models: [{ id: "test-proxy-model", name: "Test proxy" }],
+                  models: [
+                    {
+                      id: override === "alias" ? "test-proxy-model" : "kimi-for-coding",
+                      name: "Test proxy",
+                    },
+                  ],
                 },
               },
             }),
@@ -85,9 +109,11 @@ describe("credential-free usage route preparation", () => {
           providerIds: ["kimi-coding"],
         });
         const routes = await resolve(["kimi", "kimi-code", "kimi-coding"]);
-        expect(routes).toContain("https://api.kimi.com/coding/");
-        if (custom) expect(routes).toContain("https://proxy.example.test/coding/");
-        else expect(routes).toEqual(["https://api.kimi.com/coding/"]);
+        if (override !== "none") {
+          expect(routes).toContain("https://proxy.example.test/coding/");
+        } else {
+          expect(routes).toEqual(["https://api.kimi.com/coding/"]);
+        }
         expect(auth.ambient).not.toHaveBeenCalled();
         expect(auth.store).not.toHaveBeenCalled();
       });

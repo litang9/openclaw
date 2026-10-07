@@ -6,14 +6,17 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createUsageModelBaseUrlResolver } from "./provider-usage.models.js";
 
 const runtime = vi.hoisted(() => ({ published: vi.fn(), acquire: vi.fn(), dispose: vi.fn() }));
-vi.mock("../agents/prepared-model-runtime.js", () => ({
+vi.mock("../agents/prepared-model-runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../agents/prepared-model-runtime.js")>()),
   getPreparedModelRuntimeSnapshot: runtime.published,
   acquireReadOnlyPreparedModelRuntime: runtime.acquire,
 }));
-vi.mock("../agents/model-discovery-context.js", () => ({
+vi.mock("../agents/model-discovery-context.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../agents/model-discovery-context.js")>()),
   resolveModelPluginMetadataSnapshot: () => undefined,
 }));
-vi.mock("../plugins/manifest-contract-eligibility.js", () => ({
+vi.mock("../plugins/manifest-contract-eligibility.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/manifest-contract-eligibility.js")>()),
   loadManifestMetadataSnapshot: () => ({
     plugins: [{ modelCatalog: { providers: { kimi: { defaultModel: "test-model" } } } }],
   }),
@@ -49,7 +52,12 @@ function snapshot(config: OpenClawConfig, sources: unknown, extraStatic = {}) {
     staticProviderConfigs: { kimi: provider(official), ...extraStatic },
   });
   const createStores = vi.fn(() => ({ authStorage, modelRegistry: registry }));
-  return { config, isCurrent: () => true, createStores } as unknown as PreparedModelRuntimeSnapshot;
+  return {
+    config,
+    isCurrent: () => true,
+    createStores,
+    modelCatalog: { entries: registry.getAll(), routeVariants: registry.getAll() },
+  } as unknown as PreparedModelRuntimeSnapshot;
 }
 
 beforeEach(() => {
@@ -121,9 +129,9 @@ describe("usage effective model routes", () => {
   it("rejects a current publication belonging to a different config before using its routes", async () => {
     const oldConfig: OpenClawConfig = { models: { providers: { kimi: provider(official) } } };
     const config: OpenClawConfig = { models: { providers: { kimi: provider(proxy) } } };
-    runtime.published.mockReturnValue(snapshot(oldConfig, {}));
+    runtime.published.mockReturnValue(snapshot(oldConfig, { providers: {} }));
     runtime.acquire.mockResolvedValue({
-      snapshot: snapshot(config, {}),
+      snapshot: snapshot(config, { providers: {} }),
       [Symbol.asyncDispose]: runtime.dispose,
     });
     const resolve = createUsageModelBaseUrlResolver({
@@ -140,7 +148,7 @@ describe("usage effective model routes", () => {
     async (requested) => {
       const config: OpenClawConfig = { agents: { defaults: { model: "other/test-model" } } };
       runtime.acquire.mockResolvedValue({
-        snapshot: snapshot(config, {}),
+        snapshot: snapshot(config, { providers: {} }),
         [Symbol.asyncDispose]: runtime.dispose,
       });
       const controller = new AbortController();

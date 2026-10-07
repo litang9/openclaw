@@ -9,10 +9,17 @@ function captureModelBaseUrls(snapshot: PreparedModelRuntimeSnapshot) {
     return undefined;
   }
   const providers = new Map<string, Set<string>>();
-  for (const model of registry.getAll()) {
+  // Static manifest models can live only in the prepared catalog. Retain its
+  // physical variants and authored registry routes; logical deduplication must
+  // not erase a custom endpoint before the credential-family policy sees it.
+  for (const model of [
+    ...registry.getAll(),
+    ...snapshot.modelCatalog.entries,
+    ...snapshot.modelCatalog.routeVariants,
+  ]) {
     const provider = normalizeProviderId(model.provider);
     const urls = providers.get(provider) ?? new Set<string>();
-    urls.add(model.baseUrl);
+    urls.add(model.baseUrl ?? "");
     providers.set(provider, urls);
   }
   return providers;
