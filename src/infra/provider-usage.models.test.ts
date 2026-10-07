@@ -128,10 +128,12 @@ describe("usage effective model routes", () => {
 
   it("rejects a current publication belonging to a different config before using its routes", async () => {
     const oldConfig: OpenClawConfig = { models: { providers: { kimi: provider(official) } } };
-    const config: OpenClawConfig = { models: { providers: { kimi: provider(proxy) } } };
-    runtime.published.mockReturnValue(snapshot(oldConfig, { providers: {} }));
+    const config: OpenClawConfig = { models: { providers: { kimi: provider(proxy, proxy) } } };
+    const published = snapshot(oldConfig, { providers: {} });
+    const replacement = snapshot(config, { providers: {} });
+    runtime.published.mockReturnValue(published);
     runtime.acquire.mockResolvedValue({
-      snapshot: snapshot(config, { providers: {} }),
+      snapshot: replacement,
       [Symbol.asyncDispose]: runtime.dispose,
     });
     const resolve = createUsageModelBaseUrlResolver({
@@ -140,6 +142,13 @@ describe("usage effective model routes", () => {
       providerIds: ["kimi"],
     });
     expect(await resolve(family)).toEqual([proxy]);
+    expect(published.createStores).not.toHaveBeenCalled();
+    expect(replacement.createStores).toHaveBeenCalledOnce();
+    expect(runtime.acquire).toHaveBeenCalledOnce();
+    expect(runtime.acquire).toHaveBeenCalledWith(
+      expect.objectContaining({ config }),
+      expect.any(Object),
+    );
     expect(runtime.dispose).toHaveBeenCalledOnce();
   });
 
